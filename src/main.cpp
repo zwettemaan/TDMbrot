@@ -7,6 +7,10 @@
 // Algorithm mode: set to 1 for optimized recursive algorithm, 0 for naive nested loop
 #define USE_OPTIMIZED_ALGORITHM 1
 
+// Button pins
+#define BUTTON_1 0   // Left button (also BOOT button)
+#define BUTTON_2 14  // Right button
+
 TFT_eSPI tft = TFT_eSPI();
 
 // Display dimensions in landscape mode
@@ -17,7 +21,14 @@ TFT_eSPI tft = TFT_eSPI();
 uint16_t grid[WIDTH][HEIGHT];
 
 // Max steps for color mapping (set during renderMandelbrot)
-int g_maxSteps = 100;
+int g_curMaxSteps = 100;
+
+// Current view parameters
+float g_xm = -0.770;
+float g_ym = 0.095;
+float g_dm = 0.01;
+bool g_calculating = false;
+int g_maxSteps = 1000;
 
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
@@ -52,7 +63,7 @@ uint16_t stepsToColor(int steps, int maxSteps);
 void setGridPixel(int xi, int yi, uint16_t value) {
   grid[xi][yi] = value;
 #if RENDER_WHILE_CALCULATING
-  uint16_t color = stepsToColor(value, g_maxSteps);
+  uint16_t color = stepsToColor(value, g_curMaxSteps);
   tft.drawPixel(xi, yi, color);
 #endif
 }
@@ -90,12 +101,15 @@ uint16_t stepsToColor(int steps, int maxSteps) {
 void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int maxSteps) {
 
   do {
+
     if (nx < 1) {
       break;
     }
+
     if (ny < 1) {
       break;
     }
+
     if (nx == 1 && ny == 1) {
       int n = nSteps(x, y, maxSteps);
       setGridPixel(xi, yi, n);
@@ -103,48 +117,40 @@ void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int max
     }
 
 	  if (nx == 1) {
+
   		int n1 = nSteps(x, y, maxSteps);
 		  int n2 = nSteps(x, y+d*(ny-1), maxSteps);
+
 		  setGridPixel(xi, yi, n1);
 		  setGridPixel(xi, yi + ny - 1, n2);
+
       if (ny == 2) {
         break;
       }
-      if (n1 == n2 && n1 < maxSteps) {
-        // 2 less than ny, because we already set first and last
-        // Only fill if not in the set (n1 < maxSteps) to avoid artifacts
-        for (int ni = 2; ni < ny; ni++) {
-          yi++;
-          setGridPixel(xi, yi, n1);
-        }
-        break;
-      }
+
 		  int ny1 = (ny-2)/2;
 		  int ny2 = ny-2-ny1;
+
       fillGrid(xi, x, 1, yi + 1, y + d, ny1, d, maxSteps);
       fillGrid(xi, x, 1, yi + 1 + ny1, y + d*(1 + ny1), ny2, d, maxSteps);
   		break;
 	  }
 
     if (ny == 1) {
+
   		int n1 = nSteps(x, y, maxSteps);
 		  int n2 = nSteps(x + d*(nx-1), y, maxSteps);
+
 		  setGridPixel(xi, yi, n1);
 		  setGridPixel(xi + nx - 1, yi, n2);
+
       if (nx == 2) {
         break;
       }
-      if (n1 == n2 && n1 < maxSteps) {
-        // 2 less than nx, because we already set first and last
-        // Only fill if not in the set (n1 < maxSteps) to avoid artifacts
-        for (int ni = 2; ni < nx; ni++) {
-          xi++;
-          setGridPixel(xi, yi, n1);
-        }
-        break;
-      }
-		  int nx1 = (nx-2)/2;
-		  int nx2 = nx-2-nx1;
+
+      int nx1 = (nx-2)/2;
+      int nx2 = nx-2-nx1;
+
       fillGrid(xi + 1, x + d, nx1, yi, y, 1, d, maxSteps);
       fillGrid(xi + 1 + nx1, x + d*(1 + nx1), nx2, yi, y, 1, d, maxSteps);
   		break;
@@ -155,7 +161,7 @@ void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int max
     int n3 = nSteps(x, y + d*(ny-1), maxSteps);
     int n4 = nSteps(x + d*(nx-1), y + d*(ny-1), maxSteps);
 
-    if (n1 == n2 && n1 == n3 && n1 == n4 && n1 < maxSteps) {
+    if (n1 == n2 && n1 == n3 && n1 == n4 && (n1 < maxSteps)) {
       // Fill entire block
       // Only fill if not in the set (n1 < maxSteps) to avoid artifacts
       for (int xi2 = 0; xi2 < nx; xi2++) {
@@ -177,7 +183,16 @@ void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int max
     fillGrid(xi, x, 1, yi + 1, y + d, ny-2, d, maxSteps);
     fillGrid(xi + nx - 1, x + d*(nx-1), 1, yi + 1, y + d, ny-2, d, maxSteps);
 
-    fillGrid(xi + 1, x + d, nx-2, yi + 1, y + d, ny-2, d, maxSteps);
+    int nx1 = (nx-2)/2;
+    int nx2 = nx-2-nx1;
+
+    int ny1 = (ny-2)/2;
+    int ny2 = ny-2-ny1;
+
+    fillGrid(xi + 1,       x + d,           nx1, yi + 1,       y + d,         ny1, d, maxSteps);
+    fillGrid(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
+    fillGrid(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
+    fillGrid(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
 	}
   while (false);
 }
@@ -186,8 +201,9 @@ void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int max
 // xm, ym = top-left corner of window
 // dm = width of window (height = dm * 17/32)
 void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
+  g_calculating = true;
   unsigned long startTime = millis();
-  g_maxSteps = maxSteps;
+  g_curMaxSteps = maxSteps;
 
   float window_height = dm * 17.0 / 32.0;
   Serial.printf("Calculating Mandelbrot: top-left=(%.4f, %.4f), width=%.4f, height=%.4f\n", xm, ym, dm, window_height);
@@ -235,11 +251,156 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
 #else
   Serial.printf("Total time: %lu ms\n", calcTime - startTime);
 #endif
+
+  g_calculating = false;
+}
+
+// Button handling
+unsigned long button1PressTime = 0;
+unsigned long button2PressTime = 0;
+bool button1WasPressed = false;
+bool button2WasPressed = false;
+unsigned long button1ReleaseTime = 0;
+unsigned long button2ReleaseTime = 0;
+bool button1PendingSingle = false;
+bool button2PendingSingle = false;
+bool button1DoubleInProgress = false;
+bool button2DoubleInProgress = false;
+
+#define LONG_PRESS_TIME 500
+#define DOUBLE_PRESS_TIME 300
+
+void handleButtons() {
+  if (g_calculating) return; // Ignore buttons while calculating
+
+  bool btn1 = digitalRead(BUTTON_1) == LOW;
+  bool btn2 = digitalRead(BUTTON_2) == LOW;
+
+  // Check for pending single presses that have timed out
+  if (button1PendingSingle && (millis() - button1ReleaseTime >= DOUBLE_PRESS_TIME)) {
+    Serial.println("Button 1 single press: Shift left");
+    g_xm -= g_dm / 2.0;
+    renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    button1PendingSingle = false;
+    button1ReleaseTime = 0;
+  }
+
+  if (button2PendingSingle && (millis() - button2ReleaseTime >= DOUBLE_PRESS_TIME)) {
+    Serial.println("Button 2 single press: Shift right");
+    g_xm += g_dm / 2.0;
+    renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    button2PendingSingle = false;
+    button2ReleaseTime = 0;
+  }
+
+  // Button 1 handling
+  if (btn1 && !button1WasPressed) {
+    button1PressTime = millis();
+    button1WasPressed = true;
+
+    // Check if this is a double press
+    if (button1PendingSingle && (millis() - button1ReleaseTime < DOUBLE_PRESS_TIME)) {
+      // Double press detected - set flag for when button is released
+      button1DoubleInProgress = true;
+      button1PendingSingle = false;
+      button1ReleaseTime = 0;
+    }
+  } else if (!btn1 && button1WasPressed) {
+    unsigned long pressDuration = millis() - button1PressTime;
+    button1WasPressed = false;
+
+    if (pressDuration >= LONG_PRESS_TIME) {
+      // Long press: zoom in
+      Serial.println("Button 1 long press: Zoom in");
+      button1PendingSingle = false;
+      button1DoubleInProgress = false;
+      button1ReleaseTime = 0;
+      g_dm /= 2.0;
+      g_xm += g_dm / 2.0;
+      g_ym += (g_dm * 17.0 / 32.0) / 2.0;
+      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    } else if (button1DoubleInProgress) {
+      // This was a double press
+      Serial.println("Button 1 double press: Shift up");
+      button1DoubleInProgress = false;
+      button1PendingSingle = false;
+      button1ReleaseTime = 0;
+      g_ym -= g_dm / 2.0 * 17.0 / 32.0;
+      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    } else {
+      // Mark as pending single press
+      button1PendingSingle = true;
+      button1ReleaseTime = millis();
+    }
+  }
+
+  // Button 2 handling
+  if (btn2 && !button2WasPressed) {
+    button2PressTime = millis();
+    button2WasPressed = true;
+
+    // Check if this is a double press
+    if (button2PendingSingle && (millis() - button2ReleaseTime < DOUBLE_PRESS_TIME)) {
+      // Double press detected - set flag for when button is released
+      button2DoubleInProgress = true;
+      button2PendingSingle = false;
+      button2ReleaseTime = 0;
+    }
+  } else if (!btn2 && button2WasPressed) {
+    unsigned long pressDuration = millis() - button2PressTime;
+    button2WasPressed = false;
+
+    if (pressDuration >= LONG_PRESS_TIME) {
+      // Long press: zoom out
+      Serial.println("Button 2 long press: Zoom out");
+      button2PendingSingle = false;
+      button2DoubleInProgress = false;
+      button2ReleaseTime = 0;
+      float new_dm = g_dm * 2.0;
+
+      // Check if corners would go outside [-2, 2] range
+      float new_x_end = g_xm + new_dm;
+      float new_y_end = g_ym + new_dm * 17.0 / 32.0;
+
+      // Constrain to keep all corners in [-2, 2]
+      if (g_xm >= -2.0 && new_x_end <= 2.0 && g_ym >= -2.0 && new_y_end <= 2.0) {
+        g_dm = new_dm;
+        g_xm -= g_dm / 4.0;
+        g_ym -= (g_dm * 17.0 / 32.0) / 4.0;
+
+        // Clamp to boundaries
+        if (g_xm < -2.0) g_xm = -2.0;
+        if (g_ym < -2.0) g_ym = -2.0;
+        if (g_xm + g_dm > 2.0) g_xm = 2.0 - g_dm;
+        if (g_ym + g_dm * 17.0 / 32.0 > 2.0) g_ym = 2.0 - g_dm * 17.0 / 32.0;
+
+        renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+      } else {
+        Serial.println("Zoom out limited: would exceed bounds");
+      }
+    } else if (button2DoubleInProgress) {
+      // This was a double press
+      Serial.println("Button 2 double press: Shift down");
+      button2DoubleInProgress = false;
+      button2PendingSingle = false;
+      button2ReleaseTime = 0;
+      g_ym += g_dm / 2.0 * 17.0 / 32.0;
+      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    } else {
+      // Mark as pending single press
+      button2PendingSingle = true;
+      button2ReleaseTime = millis();
+    }
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Initialize buttons
+  pinMode(BUTTON_1, INPUT_PULLUP);
+  pinMode(BUTTON_2, INPUT_PULLUP);
 
   // Initialize the display
   tft.init();
@@ -256,14 +417,20 @@ void setup() {
   Serial.printf("TFT dimensions after rotation: %d x %d\n", tft.width(), tft.height());
   Serial.printf("Expected dimensions: %d x %d\n", WIDTH, HEIGHT);
 
-  // Zoom into a detailed spiral region (seahorse valley)
-  // Top-left at (-0.755, 0.095), width of 0.02
-  // Intricate spirals with lots of color detail
-  renderMandelbrot(-0.770, 0.095, 0.01, 1000);
+  // Initial render with current global parameters
+  renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
 
   Serial.println("Mandelbrot rendering complete!");
+  Serial.println("Button controls:");
+  Serial.println("  Button 1 single: Shift left");
+  Serial.println("  Button 2 single: Shift right");
+  Serial.println("  Button 1 double: Shift up");
+  Serial.println("  Button 2 double: Shift down");
+  Serial.println("  Button 1 long: Zoom in");
+  Serial.println("  Button 2 long: Zoom out");
 }
 
 void loop() {
-  // Static display, nothing to do
+  handleButtons();
+  delay(10); // Small delay for button debouncing
 }
