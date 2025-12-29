@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <esp_task_wdt.h>
 
 // Rendering mode: set to 1 to render while calculating, 0 to calculate then render
 #define RENDER_WHILE_CALCULATING 1
@@ -30,19 +31,28 @@ float g_dm = 0.01;
 bool g_calculating = false;
 int g_maxSteps = 1000;
 
-// Multi-core variables
+// Multi-core work queue system
 SemaphoreHandle_t g_renderMutex = NULL;
-volatile bool g_core1Done = false;
+QueueHandle_t g_workQueue = NULL;
+volatile int g_activeWorkers = 0;
+volatile int g_busyWorkers = 0;
+volatile bool g_workComplete = false;
 
-// Task parameters structure
-struct RenderTaskParams {
-  int startX;
-  int endX;
-  float xm;
-  float ym;
-  float dm;
-  int maxSteps;
+// Work item structure for the queue
+struct WorkItem {
+  int xi;       // Grid start X
+  float x;      // World X coordinate
+  int nx;       // Number of X pixels
+  int yi;       // Grid start Y
+  float y;      // World Y coordinate
+  int ny;       // Number of Y pixels
+  float d;      // World scale
+  int maxSteps; // Max iterations
 };
+
+// Global rendering parameters
+float g_renderScale = 0.0;
+int g_renderMaxSteps = 0;
 
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
@@ -118,132 +128,158 @@ uint16_t stepsToColor(int steps, int maxSteps) {
   }
 }
 
-void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int maxSteps) {
+// Forward declaration
+void processWorkItem(WorkItem& item);
 
-  do {
+// Helper to add work item to queue or process directly if queue is full
+void enqueueOrProcess(int xi, float x, int nx, int yi, float y, int ny, float d, int maxSteps) {
+  WorkItem item = {xi, x, nx, yi, y, ny, d, maxSteps};
 
-    if (nx < 1) {
-      break;
-    }
+  // If queue has space, enqueue
+  if (xQueueSend(g_workQueue, &item, 0) == pdTRUE) {
+    return;
+  }
 
-    if (ny < 1) {
-      break;
-    }
+  // Queue is full - process directly
+  processWorkItem(item);
+}
 
-    if (nx == 1 && ny == 1) {
-      int n = nSteps(x, y, maxSteps);
-      setGridPixel(xi, yi, n);
-      break;
-    }
+// Process a single work item - either subdivide or calculate
+void processWorkItem(WorkItem& item) {
 
-	  if (nx == 1) {
+  int xi = item.xi;
+  float x = item.x;
+  int nx = item.nx;
+  int yi = item.yi;
+  float y = item.y;
+  int ny = item.ny;
+  float d = item.d;
+  int maxSteps = item.maxSteps;
 
-  		int n1 = nSteps(x, y, maxSteps);
-		  int n2 = nSteps(x, y+d*(ny-1), maxSteps);
+  if (nx < 1 || ny < 1) {
+    return;
+  }
 
-		  setGridPixel(xi, yi, n1);
-		  setGridPixel(xi, yi + ny - 1, n2);
+  if (nx == 1 && ny == 1) {
+    int n = nSteps(x, y, maxSteps);
+    setGridPixel(xi, yi, n);
+    return;
+  }
 
-      if (ny == 2) {
-        break;
-      }
-
-		  int ny1 = (ny-2)/2;
-		  int ny2 = ny-2-ny1;
-
-      fillGrid(xi, x, 1, yi + 1, y + d, ny1, d, maxSteps);
-      fillGrid(xi, x, 1, yi + 1 + ny1, y + d*(1 + ny1), ny2, d, maxSteps);
-  		break;
-	  }
-
-    if (ny == 1) {
-
-  		int n1 = nSteps(x, y, maxSteps);
-		  int n2 = nSteps(x + d*(nx-1), y, maxSteps);
-
-		  setGridPixel(xi, yi, n1);
-		  setGridPixel(xi + nx - 1, yi, n2);
-
-      if (nx == 2) {
-        break;
-      }
-
-      int nx1 = (nx-2)/2;
-      int nx2 = nx-2-nx1;
-
-      fillGrid(xi + 1, x + d, nx1, yi, y, 1, d, maxSteps);
-      fillGrid(xi + 1 + nx1, x + d*(1 + nx1), nx2, yi, y, 1, d, maxSteps);
-  		break;
-	  }
-
+  if (nx == 1) {
     int n1 = nSteps(x, y, maxSteps);
-    int n2 = nSteps(x + d*(nx-1), y, maxSteps);
-    int n3 = nSteps(x, y + d*(ny-1), maxSteps);
-    int n4 = nSteps(x + d*(nx-1), y + d*(ny-1), maxSteps);
-
-    if (n1 == n2 && n1 == n3 && n1 == n4 && (n1 < maxSteps)) {
-      // Fill entire block
-      // Only fill if not in the set (n1 < maxSteps) to avoid artifacts
-      for (int xi2 = 0; xi2 < nx; xi2++) {
-        for (int yi2 = 0; yi2 < ny; yi2++) {
-          setGridPixel(xi + xi2, yi + yi2, n1);
-        }
-      }
-      break;
-    }
+    int n2 = nSteps(x, y+d*(ny-1), maxSteps);
 
     setGridPixel(xi, yi, n1);
-    setGridPixel(xi + nx - 1, yi, n2);
-    setGridPixel(xi, yi + ny - 1, n3);
-    setGridPixel(xi + nx - 1, yi + ny - 1, n4);
+    setGridPixel(xi, yi + ny - 1, n2);
 
-    fillGrid(xi + 1, x + d, nx-2, yi, y, 1, d, maxSteps);
-    fillGrid(xi + 1, x + d, nx-2, yi + ny - 1, y + d*(ny-1), 1, d, maxSteps);
-
-    fillGrid(xi, x, 1, yi + 1, y + d, ny-2, d, maxSteps);
-    fillGrid(xi + nx - 1, x + d*(nx-1), 1, yi + 1, y + d, ny-2, d, maxSteps);
-
-    int nx1 = (nx-2)/2;
-    int nx2 = nx-2-nx1;
+    if (ny == 2) {
+      return;
+    }
 
     int ny1 = (ny-2)/2;
     int ny2 = ny-2-ny1;
 
-    fillGrid(xi + 1,       x + d,           nx1, yi + 1,       y + d,         ny1, d, maxSteps);
-    fillGrid(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
-    fillGrid(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
-    fillGrid(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
-	}
-  while (false);
+    enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny1, d, maxSteps);
+    enqueueOrProcess(xi, x, 1, yi + 1 + ny1, y + d*(1 + ny1), ny2, d, maxSteps);
+    return;
+  }
+
+  if (ny == 1) {
+    int n1 = nSteps(x, y, maxSteps);
+    int n2 = nSteps(x + d*(nx-1), y, maxSteps);
+
+    setGridPixel(xi, yi, n1);
+    setGridPixel(xi + nx - 1, yi, n2);
+
+    if (nx == 2) {
+      return;
+    }
+
+    int nx1 = (nx-2)/2;
+    int nx2 = nx-2-nx1;
+
+    enqueueOrProcess(xi + 1, x + d, nx1, yi, y, 1, d, maxSteps);
+    enqueueOrProcess(xi + 1 + nx1, x + d*(1 + nx1), nx2, yi, y, 1, d, maxSteps);
+    return;
+  }
+
+  int n1 = nSteps(x, y, maxSteps);
+  int n2 = nSteps(x + d*(nx-1), y, maxSteps);
+  int n3 = nSteps(x, y + d*(ny-1), maxSteps);
+  int n4 = nSteps(x + d*(nx-1), y + d*(ny-1), maxSteps);
+
+  if (n1 == n2 && n1 == n3 && n1 == n4 && (n1 < maxSteps)) {
+    // Fill entire block - calculate directly without queueing
+    for (int xi2 = 0; xi2 < nx; xi2++) {
+      for (int yi2 = 0; yi2 < ny; yi2++) {
+        setGridPixel(xi + xi2, yi + yi2, n1);
+      }
+    }
+    return;
+  }
+
+  setGridPixel(xi, yi, n1);
+  setGridPixel(xi + nx - 1, yi, n2);
+  setGridPixel(xi, yi + ny - 1, n3);
+  setGridPixel(xi + nx - 1, yi + ny - 1, n4);
+
+  // Subdivide and add to queue (or process directly if queue is full)
+  enqueueOrProcess(xi + 1, x + d, nx-2, yi, y, 1, d, maxSteps);
+  enqueueOrProcess(xi + 1, x + d, nx-2, yi + ny - 1, y + d*(ny-1), 1, d, maxSteps);
+
+  enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny-2, d, maxSteps);
+  enqueueOrProcess(xi + nx - 1, x + d*(nx-1), 1, yi + 1, y + d, ny-2, d, maxSteps);
+
+  int nx1 = (nx-2)/2;
+  int nx2 = nx-2-nx1;
+
+  int ny1 = (ny-2)/2;
+  int ny2 = ny-2-ny1;
+
+  enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1,       y + d,         ny1, d, maxSteps);
+  enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
+  enqueueOrProcess(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
+  enqueueOrProcess(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
 }
 
-// Partial fill for multi-core rendering
-void fillGridPartial(int startX, int endX, float xm, float ym, float dm, int maxSteps) {
-  float scale = dm / 320.0;
-  int width = endX - startX;
-  
+// Worker task - pulls work from queue and processes it
+void workerTask(void* params) {
+  int coreId = (int)params;
+
+  while (true) {
+    WorkItem item;
+
+    // Try to get work from queue (wait up to 50ms to allow watchdog resets)
+    if (xQueueReceive(g_workQueue, &item, pdMS_TO_TICKS(50)) == pdTRUE) {
+      __atomic_add_fetch(&g_busyWorkers, 1, __ATOMIC_SEQ_CST);
+
+      // Process the work item
 #if USE_OPTIMIZED_ALGORITHM
-  // Optimized recursive algorithm for this range
-  fillGrid(startX, xm + startX * scale, width, 0, ym, HEIGHT, scale, maxSteps);
+      processWorkItem(item);
 #else
-  // Naive nested loop algorithm for this range
-  for (int xi = startX; xi < endX; xi++) {
-    for (int yi = 0; yi < HEIGHT; yi++) {
-      float x = xm + xi * scale;
-      float y = ym + yi * scale;
-      int n = nSteps(x, y, maxSteps);
-      setGridPixel(xi, yi, n);
+      // Naive algorithm - just calculate the region
+      float scale = item.d;
+      for (int xi = item.xi; xi < item.xi + item.nx; xi++) {
+        for (int yi = item.yi; yi < item.yi + item.ny; yi++) {
+          float x = item.x + (xi - item.xi) * scale;
+          float y = item.y + (yi - item.yi) * scale;
+          int n = nSteps(x, y, item.maxSteps);
+          setGridPixel(xi, yi, n);
+        }
+      }
+#endif
+
+      __atomic_sub_fetch(&g_busyWorkers, 1, __ATOMIC_SEQ_CST);
+    } else {
+      // No work in queue - check if all workers are idle
+      if (g_busyWorkers == 0 && uxQueueMessagesWaiting(g_workQueue) == 0) {
+        __atomic_sub_fetch(&g_activeWorkers, 1, __ATOMIC_SEQ_CST);
+        vTaskDelete(NULL);
+        return;
+      }
     }
   }
-#endif
-}
-
-// Task to run on core 1
-void core1Task(void* params) {
-  RenderTaskParams* p = (RenderTaskParams*)params;
-  fillGridPartial(p->startX, p->endX, p->xm, p->ym, p->dm, p->maxSteps);
-  g_core1Done = true;
-  vTaskDelete(NULL);
 }
 
 // Calculate and render Mandelbrot set
@@ -258,40 +294,76 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
   Serial.printf("Calculating Mandelbrot: top-left=(%.4f, %.4f), width=%.4f, height=%.4f\n", xm, ym, dm, window_height);
   Serial.printf("Render mode: %s\n", RENDER_WHILE_CALCULATING ? "while-calculating" : "post-render");
   Serial.printf("Algorithm: %s\n", USE_OPTIMIZED_ALGORITHM ? "optimized-recursive" : "naive-loop");
-  Serial.println("Using dual-core rendering");
+  Serial.println("Using queue-based dual-core rendering");
 
-  // Split work between cores
-  int midPoint = WIDTH / 2;
-  
-  // Setup task parameters for core 1
-  RenderTaskParams taskParams;
-  taskParams.startX = midPoint;
-  taskParams.endX = WIDTH;
-  taskParams.xm = xm;
-  taskParams.ym = ym;
-  taskParams.dm = dm;
-  taskParams.maxSteps = maxSteps;
-  
-  g_core1Done = false;
-  
-  // Create task on core 1 (core 0 is typically used for WiFi/system tasks)
-  xTaskCreatePinnedToCore(
-    core1Task,           // Task function
-    "Core1Render",       // Task name
-    8192,                // Stack size
-    &taskParams,         // Parameters
-    1,                   // Priority
-    NULL,                // Task handle
-    1                    // Core ID
-  );
-  
-  // Calculate left half on core 0
-  fillGridPartial(0, midPoint, xm, ym, dm, maxSteps);
-  
-  // Wait for core 1 to finish
-  while (!g_core1Done) {
-    delay(1);
+  // Clear and reset work queue
+  if (g_workQueue != NULL) {
+    xQueueReset(g_workQueue);
   }
+
+  g_workComplete = false;
+  g_activeWorkers = 2;
+  g_busyWorkers = 0;
+  g_renderScale = dm / 320.0;
+  g_renderMaxSteps = maxSteps;
+
+  // Create worker tasks on both cores (priority 0 same as IDLE)
+  xTaskCreatePinnedToCore(
+    workerTask,          // Task function
+    "Worker0",           // Task name
+    8192,                // Stack size
+    (void*)0,            // Core ID as parameter
+    0,                   // Priority
+    NULL,                // Task handle
+    0                    // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+    workerTask,          // Task function
+    "Worker1",           // Task name
+    8192,                // Stack size
+    (void*)1,            // Core ID as parameter
+    0,                   // Priority
+    NULL,                // Task handle
+    1                    // Core 1
+  );
+
+  // Add initial work item to queue
+#if USE_OPTIMIZED_ALGORITHM
+  WorkItem initialItem;
+  initialItem.xi = 0;
+  initialItem.x = xm;
+  initialItem.nx = WIDTH;
+  initialItem.yi = 0;
+  initialItem.y = ym;
+  initialItem.ny = HEIGHT;
+  initialItem.d = g_renderScale;
+  initialItem.maxSteps = maxSteps;
+  xQueueSend(g_workQueue, &initialItem, 0);
+#else
+  // For naive algorithm, split into chunks for better distribution
+  int chunkSize = 40; // Process in 40-pixel wide vertical strips
+  for (int xi = 0; xi < WIDTH; xi += chunkSize) {
+    int nx = min(chunkSize, WIDTH - xi);
+    WorkItem item;
+    item.xi = xi;
+    item.x = xm + xi * g_renderScale;
+    item.nx = nx;
+    item.yi = 0;
+    item.y = ym;
+    item.ny = HEIGHT;
+    item.d = g_renderScale;
+    item.maxSteps = maxSteps;
+    xQueueSend(g_workQueue, &item, 0);
+  }
+#endif
+
+  // Wait for all workers to finish
+  while (g_activeWorkers > 0) {
+    delay(10);
+  }
+
+  g_workComplete = true;
 
   unsigned long calcTime = millis();
   Serial.printf("Calculation complete: %lu ms\n", calcTime - startTime);
@@ -460,6 +532,9 @@ void setup() {
 
   // Create mutex for thread-safe rendering
   g_renderMutex = xSemaphoreCreateMutex();
+
+  // Create work queue (holds up to 100 work items)
+  g_workQueue = xQueueCreate(100, sizeof(WorkItem));
 
   // Initialize buttons
   pinMode(BUTTON_1, INPUT_PULLUP);
