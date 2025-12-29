@@ -30,6 +30,20 @@ float g_dm = 0.01;
 bool g_calculating = false;
 int g_maxSteps = 1000;
 
+// Multi-core variables
+SemaphoreHandle_t g_renderMutex = NULL;
+volatile bool g_core1Done = false;
+
+// Task parameters structure
+struct RenderTaskParams {
+  int startX;
+  int endX;
+  float xm;
+  float ym;
+  float dm;
+  int maxSteps;
+};
+
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
   float x = 0.0;
@@ -64,7 +78,13 @@ void setGridPixel(int xi, int yi, uint16_t value) {
   grid[xi][yi] = value;
 #if RENDER_WHILE_CALCULATING
   uint16_t color = stepsToColor(value, g_curMaxSteps);
-  tft.drawPixel(xi, yi, color);
+  if (g_renderMutex != NULL) {
+    xSemaphoreTake(g_renderMutex, portMAX_DELAY);
+    tft.drawPixel(xi, yi, color);
+    xSemaphoreGive(g_renderMutex);
+  } else {
+    tft.drawPixel(xi, yi, color);
+  }
 #endif
 }
 
@@ -197,6 +217,35 @@ void fillGrid(int xi, float x, int nx, int yi, float y, int ny, float d, int max
   while (false);
 }
 
+// Partial fill for multi-core rendering
+void fillGridPartial(int startX, int endX, float xm, float ym, float dm, int maxSteps) {
+  float scale = dm / 320.0;
+  int width = endX - startX;
+  
+#if USE_OPTIMIZED_ALGORITHM
+  // Optimized recursive algorithm for this range
+  fillGrid(startX, xm + startX * scale, width, 0, ym, HEIGHT, scale, maxSteps);
+#else
+  // Naive nested loop algorithm for this range
+  for (int xi = startX; xi < endX; xi++) {
+    for (int yi = 0; yi < HEIGHT; yi++) {
+      float x = xm + xi * scale;
+      float y = ym + yi * scale;
+      int n = nSteps(x, y, maxSteps);
+      setGridPixel(xi, yi, n);
+    }
+  }
+#endif
+}
+
+// Task to run on core 1
+void core1Task(void* params) {
+  RenderTaskParams* p = (RenderTaskParams*)params;
+  fillGridPartial(p->startX, p->endX, p->xm, p->ym, p->dm, p->maxSteps);
+  g_core1Done = true;
+  vTaskDelete(NULL);
+}
+
 // Calculate and render Mandelbrot set
 // xm, ym = top-left corner of window
 // dm = width of window (height = dm * 17/32)
@@ -209,29 +258,40 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
   Serial.printf("Calculating Mandelbrot: top-left=(%.4f, %.4f), width=%.4f, height=%.4f\n", xm, ym, dm, window_height);
   Serial.printf("Render mode: %s\n", RENDER_WHILE_CALCULATING ? "while-calculating" : "post-render");
   Serial.printf("Algorithm: %s\n", USE_OPTIMIZED_ALGORITHM ? "optimized-recursive" : "naive-loop");
+  Serial.println("Using dual-core rendering");
 
-  // Calculate the grid
-  float scale = dm/320.0;
-
-#if USE_OPTIMIZED_ALGORITHM
-  // Optimized recursive algorithm
-  fillGrid(0, xm, WIDTH, 0, ym, HEIGHT, scale, maxSteps);
-#else
-  // Naive nested loop algorithm
-  for (int xi = 0; xi < WIDTH; xi++) {
-    for (int yi = 0; yi < HEIGHT; yi++) {
-      float x = xm + xi * scale;
-      float y = ym + yi * scale;
-      int n = nSteps(x, y, maxSteps);
-      setGridPixel(xi, yi, n);
-    }
-
-    // Progress indicator every 32 columns
-    if (xi % 32 == 0) {
-      Serial.printf("Progress: %d%%\n", (xi * 100) / WIDTH);
-    }
+  // Split work between cores
+  int midPoint = WIDTH / 2;
+  
+  // Setup task parameters for core 1
+  RenderTaskParams taskParams;
+  taskParams.startX = midPoint;
+  taskParams.endX = WIDTH;
+  taskParams.xm = xm;
+  taskParams.ym = ym;
+  taskParams.dm = dm;
+  taskParams.maxSteps = maxSteps;
+  
+  g_core1Done = false;
+  
+  // Create task on core 1 (core 0 is typically used for WiFi/system tasks)
+  xTaskCreatePinnedToCore(
+    core1Task,           // Task function
+    "Core1Render",       // Task name
+    8192,                // Stack size
+    &taskParams,         // Parameters
+    1,                   // Priority
+    NULL,                // Task handle
+    1                    // Core ID
+  );
+  
+  // Calculate left half on core 0
+  fillGridPartial(0, midPoint, xm, ym, dm, maxSteps);
+  
+  // Wait for core 1 to finish
+  while (!g_core1Done) {
+    delay(1);
   }
-#endif
 
   unsigned long calcTime = millis();
   Serial.printf("Calculation complete: %lu ms\n", calcTime - startTime);
@@ -397,6 +457,9 @@ void handleButtons() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Create mutex for thread-safe rendering
+  g_renderMutex = xSemaphoreCreateMutex();
 
   // Initialize buttons
   pinMode(BUTTON_1, INPUT_PULLUP);
