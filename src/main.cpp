@@ -29,14 +29,15 @@ float g_xm = -0.770;
 float g_ym = 0.095;
 float g_dm = 0.01;
 bool g_calculating = false;
-int g_maxSteps = 1000;
+const int c_maxSteps = 1000;
 
 // Multi-core work queue system
 SemaphoreHandle_t g_renderMutex = NULL;
 QueueHandle_t g_workQueue = NULL;
+
 volatile int g_activeWorkers = 0;
+
 volatile int g_busyWorkers = 0;
-volatile bool g_workComplete = false;
 
 // Work item structure for the queue
 struct WorkItem {
@@ -53,6 +54,9 @@ struct WorkItem {
 // Global rendering parameters
 float g_renderScale = 0.0;
 int g_renderMaxSteps = 0;
+
+uint16_t stepsToColor(int steps, int maxSteps);
+void processWorkItem(WorkItem& item);
 
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
@@ -80,59 +84,105 @@ int nSteps(float x0, float y0, int maxSteps) {
   return steps;
 }
 
-// Forward declaration
-uint16_t stepsToColor(int steps, int maxSteps);
+// Per-core pending region buffers to reduce mutex contention
+#define MAX_PENDING_REGIONS 100
+struct PendingRegion {
+  int x;   // Start X
+  int y;   // Start Y
+  int nx;  // Width
+  int ny;  // Height
+};
+PendingRegion g_pendingRegions[2][MAX_PENDING_REGIONS]; // [coreId][regions]
+int g_pendingCount[2] = {0, 0};
+__thread int g_coreId = -1; // Thread-local core ID
 
-// Set grid value and optionally render immediately
-void setGridPixel(int xi, int yi, uint16_t value) {
-  grid[xi][yi] = value;
-#if RENDER_WHILE_CALCULATING
-  uint16_t color = stepsToColor(value, g_curMaxSteps);
-  if (g_renderMutex != NULL) {
-    xSemaphoreTake(g_renderMutex, portMAX_DELAY);
-    tft.drawPixel(xi, yi, color);
-    xSemaphoreGive(g_renderMutex);
-  } else {
-    tft.drawPixel(xi, yi, color);
+// Flush pending regions to display (must hold mutex)
+void flushPendingRegions(const int coreId) {
+  int* pc = &g_pendingCount[coreId];
+  for (int i = 0; i < *pc; i++) {
+    PendingRegion& pr = g_pendingRegions[coreId][i];
+    // Render the region from grid data
+    for (int xi = 0; xi < pr.nx; xi++) {
+      for (int yi = 0; yi < pr.ny; yi++) {
+        const uint16_t color = stepsToColor(grid[pr.x + xi][pr.y + yi], g_curMaxSteps);
+        tft.drawPixel(pr.x + xi, pr.y + yi, color);
+      }
+    }
   }
+  *pc = 0;
+}
+
+// Set grid value (no rendering)
+inline void setGridPixel(const int xi, const int yi, const uint16_t value) {
+  grid[xi][yi] = value;
+}
+
+// Render a region from grid to display (with buffering if mutex busy)
+void renderRegion(const int xi, const int yi, const int nx, const int ny) {
+#if RENDER_WHILE_CALCULATING
+  if (g_coreId < 0) return; // Not in worker context
+
+  bool hasSemaphore = false;
+  // Check if buffer is full BEFORE adding
+  if (g_pendingCount[g_coreId] >= MAX_PENDING_REGIONS) {
+    // Buffer full - must wait for mutex then flush
+    xSemaphoreTake(g_renderMutex, portMAX_DELAY);
+    hasSemaphore = true;
+  }
+
+  // Add region to buffer
+  PendingRegion& pr = g_pendingRegions[g_coreId][g_pendingCount[g_coreId]];
+  pr.x = xi;
+  pr.y = yi;
+  pr.nx = nx;
+  pr.ny = ny;
+  g_pendingCount[g_coreId]++;
+
+  // Try to get mutex without blocking
+  if (hasSemaphore || xSemaphoreTake(g_renderMutex, 0) == pdTRUE) {
+    // Got mutex - flush all pending regions
+    flushPendingRegions(g_coreId);
+    xSemaphoreGive(g_renderMutex);
+  }
+  // else: buffer has space, keep calculating
 #endif
 }
 
 // Map iteration count to color
-uint16_t stepsToColor(int steps, int maxSteps) {
+uint16_t stepsToColor(const int steps, const int maxSteps) {
+
   if (steps >= maxSteps) {
     return TFT_BLACK; // Inside the set
   }
 
-  // Create a color gradient
-  uint8_t hue = (steps * 255) / maxSteps;
+  // Use logarithmic scale to spread out low iteration counts
+  // Most detail is at the edges with low iteration counts
+  const float normalized = log(steps + 1) / log(maxSteps + 1);
+  uint8_t hue = (uint8_t)(normalized * 255);
+  uint8_t r, g, b;
 
   // Simple RGB mapping
   if (hue < 85) {
-    uint8_t r = hue * 3;
-    uint8_t g = 255 - hue * 3;
-    uint8_t b = 0;
-    return tft.color565(r, g, b);
+    r = hue * 3;
+    g = 255 - hue * 3;
+    b = 0;
   } else if (hue < 170) {
     hue -= 85;
-    uint8_t r = 255 - hue * 3;
-    uint8_t g = 0;
-    uint8_t b = hue * 3;
-    return tft.color565(r, g, b);
+    r = 255 - hue * 3;
+    g = 0;
+    b = hue * 3;
   } else {
     hue -= 170;
-    uint8_t r = 0;
-    uint8_t g = hue * 3;
-    uint8_t b = 255 - hue * 3;
-    return tft.color565(r, g, b);
+    r = 0;
+    g = hue * 3;
+    b = 255 - hue * 3;
   }
+
+  return tft.color565(r, g, b);
 }
 
-// Forward declaration
-void processWorkItem(WorkItem& item);
-
 // Helper to add work item to queue or process directly if queue is full
-void enqueueOrProcess(int xi, float x, int nx, int yi, float y, int ny, float d, int maxSteps) {
+void enqueueOrProcess(const int xi, const float x, const int nx, const int yi, const float y, const int ny, const float d, const int maxSteps) {
   WorkItem item = {xi, x, nx, yi, y, ny, d, maxSteps};
 
   // If queue has space, enqueue
@@ -147,38 +197,43 @@ void enqueueOrProcess(int xi, float x, int nx, int yi, float y, int ny, float d,
 // Process a single work item - either subdivide or calculate
 void processWorkItem(WorkItem& item) {
 
-  int xi = item.xi;
-  float x = item.x;
-  int nx = item.nx;
-  int yi = item.yi;
-  float y = item.y;
-  int ny = item.ny;
-  float d = item.d;
-  int maxSteps = item.maxSteps;
+  const int nx = item.nx;
+  const int ny = item.ny;
 
   if (nx < 1 || ny < 1) {
     return;
   }
 
+  const int xi = item.xi;
+  const int yi = item.yi;
+  const float x = item.x;
+  const float y = item.y;
+  const int maxSteps = item.maxSteps;
+
   if (nx == 1 && ny == 1) {
-    int n = nSteps(x, y, maxSteps);
+    const int n = nSteps(x, y, maxSteps);
     setGridPixel(xi, yi, n);
+    renderRegion(xi, yi, 1, 1);
     return;
   }
 
+  const float d = item.d;
+
   if (nx == 1) {
-    int n1 = nSteps(x, y, maxSteps);
-    int n2 = nSteps(x, y+d*(ny-1), maxSteps);
+    const int n1 = nSteps(x, y, maxSteps);
+    const int n2 = nSteps(x, y+d*(ny-1), maxSteps);
 
     setGridPixel(xi, yi, n1);
     setGridPixel(xi, yi + ny - 1, n2);
+    renderRegion(xi, yi, 1, 1);
+    renderRegion(xi, yi + ny - 1, 1, 1);
 
     if (ny == 2) {
       return;
     }
 
-    int ny1 = (ny-2)/2;
-    int ny2 = ny-2-ny1;
+    const int ny1 = (ny-2)/2;
+    const int ny2 = ny-2-ny1;
 
     enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny1, d, maxSteps);
     enqueueOrProcess(xi, x, 1, yi + 1 + ny1, y + d*(1 + ny1), ny2, d, maxSteps);
@@ -186,18 +241,20 @@ void processWorkItem(WorkItem& item) {
   }
 
   if (ny == 1) {
-    int n1 = nSteps(x, y, maxSteps);
-    int n2 = nSteps(x + d*(nx-1), y, maxSteps);
+    const int n1 = nSteps(x, y, maxSteps);
+    const int n2 = nSteps(x + d*(nx-1), y, maxSteps);
 
     setGridPixel(xi, yi, n1);
     setGridPixel(xi + nx - 1, yi, n2);
+    renderRegion(xi, yi, 1, 1);
+    renderRegion(xi + nx - 1, yi, 1, 1);
 
     if (nx == 2) {
       return;
     }
 
-    int nx1 = (nx-2)/2;
-    int nx2 = nx-2-nx1;
+    const int nx1 = (nx-2)/2;
+    const int nx2 = nx-2-nx1;
 
     enqueueOrProcess(xi + 1, x + d, nx1, yi, y, 1, d, maxSteps);
     enqueueOrProcess(xi + 1 + nx1, x + d*(1 + nx1), nx2, yi, y, 1, d, maxSteps);
@@ -210,12 +267,13 @@ void processWorkItem(WorkItem& item) {
   int n4 = nSteps(x + d*(nx-1), y + d*(ny-1), maxSteps);
 
   if (n1 == n2 && n1 == n3 && n1 == n4 && (n1 < maxSteps)) {
-    // Fill entire block - calculate directly without queueing
+    // Fill entire block - set grid values then render as single region
     for (int xi2 = 0; xi2 < nx; xi2++) {
       for (int yi2 = 0; yi2 < ny; yi2++) {
         setGridPixel(xi + xi2, yi + yi2, n1);
       }
     }
+    renderRegion(xi, yi, nx, ny);
     return;
   }
 
@@ -224,6 +282,12 @@ void processWorkItem(WorkItem& item) {
   setGridPixel(xi, yi + ny - 1, n3);
   setGridPixel(xi + nx - 1, yi + ny - 1, n4);
 
+  // Render corners as individual pixels (not contiguous regions)
+  renderRegion(xi, yi, 1, 1);
+  renderRegion(xi + nx - 1, yi, 1, 1);
+  renderRegion(xi, yi + ny - 1, 1, 1);
+  renderRegion(xi + nx - 1, yi + ny - 1, 1, 1);
+
   // Subdivide and add to queue (or process directly if queue is full)
   enqueueOrProcess(xi + 1, x + d, nx-2, yi, y, 1, d, maxSteps);
   enqueueOrProcess(xi + 1, x + d, nx-2, yi + ny - 1, y + d*(ny-1), 1, d, maxSteps);
@@ -231,12 +295,11 @@ void processWorkItem(WorkItem& item) {
   enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny-2, d, maxSteps);
   enqueueOrProcess(xi + nx - 1, x + d*(nx-1), 1, yi + 1, y + d, ny-2, d, maxSteps);
 
-  int nx1 = (nx-2)/2;
-  int nx2 = nx-2-nx1;
+  const int nx1 = (nx-2)/2;
+  const int nx2 = nx-2-nx1;
 
-  int ny1 = (ny-2)/2;
-  int ny2 = ny-2-ny1;
-
+  const int ny1 = (ny-2)/2;
+  const int ny2 = ny-2-ny1;
   enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1,       y + d,         ny1, d, maxSteps);
   enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
   enqueueOrProcess(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
@@ -245,14 +308,19 @@ void processWorkItem(WorkItem& item) {
 
 // Worker task - pulls work from queue and processes it
 void workerTask(void* params) {
-  int coreId = (int)params;
 
-  while (true) {
+  const int coreId = (int)params;
+  g_coreId = coreId; // Set thread-local core ID
+
+  bool working = true;
+
+  while (working) {
     WorkItem item;
 
-    // Try to get work from queue (wait up to 50ms to allow watchdog resets)
-    if (xQueueReceive(g_workQueue, &item, pdMS_TO_TICKS(50)) == pdTRUE) {
-      __atomic_add_fetch(&g_busyWorkers, 1, __ATOMIC_SEQ_CST);
+    // Try to get work from queue (wait up to 1ms to allow watchdog resets)
+    if (xQueueReceive(g_workQueue, &item, 0) == pdTRUE) {
+      const int flag = 1 << g_coreId;
+      __atomic_or_fetch(&g_busyWorkers, flag, __ATOMIC_SEQ_CST);
 
       // Process the work item
 #if USE_OPTIMIZED_ALGORITHM
@@ -270,23 +338,31 @@ void workerTask(void* params) {
       }
 #endif
 
-      __atomic_sub_fetch(&g_busyWorkers, 1, __ATOMIC_SEQ_CST);
+        __atomic_and_fetch(&g_busyWorkers, ~flag, __ATOMIC_SEQ_CST);
     } else {
-      // No work in queue - check if all workers are idle
       if (g_busyWorkers == 0 && uxQueueMessagesWaiting(g_workQueue) == 0) {
-        __atomic_sub_fetch(&g_activeWorkers, 1, __ATOMIC_SEQ_CST);
-        vTaskDelete(NULL);
-        return;
+        working = false;
+#if RENDER_WHILE_CALCULATING
+        // Flush any remaining pending regions before exiting
+        if (xSemaphoreTake(g_renderMutex, portMAX_DELAY) == pdTRUE) {
+          flushPendingRegions(coreId);
+          xSemaphoreGive(g_renderMutex);
+        }
+#endif
       }
     }
   }
+  __atomic_sub_fetch(&g_activeWorkers, 1, __ATOMIC_SEQ_CST);
+  vTaskDelete(NULL);
 }
 
 // Calculate and render Mandelbrot set
 // xm, ym = top-left corner of window
 // dm = width of window (height = dm * 17/32)
-void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
+void renderMandelbrot(const float xm, const float ym, const float dm, const int maxSteps) {
+
   g_calculating = true;
+
   unsigned long startTime = millis();
   g_curMaxSteps = maxSteps;
 
@@ -301,12 +377,16 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
     xQueueReset(g_workQueue);
   }
 
-  g_workComplete = false;
-  g_activeWorkers = 2;
+  g_activeWorkers = 0;
   g_busyWorkers = 0;
   g_renderScale = dm / 320.0;
   g_renderMaxSteps = maxSteps;
 
+  // Reset pending region buffers
+  g_pendingCount[0] = 0;
+  g_pendingCount[1] = 0;
+
+  __atomic_add_fetch(&g_activeWorkers, 1, __ATOMIC_SEQ_CST);
   // Create worker tasks on both cores (priority 0 same as IDLE)
   xTaskCreatePinnedToCore(
     workerTask,          // Task function
@@ -318,6 +398,7 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
     0                    // Core 0
   );
 
+  __atomic_add_fetch(&g_activeWorkers, 1, __ATOMIC_SEQ_CST);
   xTaskCreatePinnedToCore(
     workerTask,          // Task function
     "Worker1",           // Task name
@@ -359,11 +440,9 @@ void renderMandelbrot(float xm, float ym, float dm, int maxSteps) {
 #endif
 
   // Wait for all workers to finish
-  while (g_activeWorkers > 0) {
+  while (g_activeWorkers) {
     delay(10);
   }
-
-  g_workComplete = true;
 
   unsigned long calcTime = millis();
   Serial.printf("Calculation complete: %lu ms\n", calcTime - startTime);
@@ -412,7 +491,7 @@ void handleButtons() {
   if (button1PendingSingle && (millis() - button1ReleaseTime >= DOUBLE_PRESS_TIME)) {
     Serial.println("Button 1 single press: Shift left");
     g_xm -= g_dm / 2.0;
-    renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
     button1PendingSingle = false;
     button1ReleaseTime = 0;
   }
@@ -420,7 +499,7 @@ void handleButtons() {
   if (button2PendingSingle && (millis() - button2ReleaseTime >= DOUBLE_PRESS_TIME)) {
     Serial.println("Button 2 single press: Shift right");
     g_xm += g_dm / 2.0;
-    renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+    renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
     button2PendingSingle = false;
     button2ReleaseTime = 0;
   }
@@ -450,7 +529,7 @@ void handleButtons() {
       g_dm /= 2.0;
       g_xm += g_dm / 2.0;
       g_ym += (g_dm * 17.0 / 32.0) / 2.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
     } else if (button1DoubleInProgress) {
       // This was a double press
       Serial.println("Button 1 double press: Shift up");
@@ -458,7 +537,7 @@ void handleButtons() {
       button1PendingSingle = false;
       button1ReleaseTime = 0;
       g_ym -= g_dm / 2.0 * 17.0 / 32.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
     } else {
       // Mark as pending single press
       button1PendingSingle = true;
@@ -506,7 +585,7 @@ void handleButtons() {
         if (g_xm + g_dm > 2.0) g_xm = 2.0 - g_dm;
         if (g_ym + g_dm * 17.0 / 32.0 > 2.0) g_ym = 2.0 - g_dm * 17.0 / 32.0;
 
-        renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+        renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
       } else {
         Serial.println("Zoom out limited: would exceed bounds");
       }
@@ -517,7 +596,7 @@ void handleButtons() {
       button2PendingSingle = false;
       button2ReleaseTime = 0;
       g_ym += g_dm / 2.0 * 17.0 / 32.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
     } else {
       // Mark as pending single press
       button2PendingSingle = true;
@@ -556,7 +635,7 @@ void setup() {
   Serial.printf("Expected dimensions: %d x %d\n", WIDTH, HEIGHT);
 
   // Initial render with current global parameters
-  renderMandelbrot(g_xm, g_ym, g_dm, g_maxSteps);
+  renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
 
   Serial.println("Mandelbrot rendering complete!");
   Serial.println("Button controls:");
