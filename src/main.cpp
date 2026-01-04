@@ -51,6 +51,10 @@ struct WorkItem {
   int maxSteps; // Max iterations
 };
 
+float g_xTop;
+float g_yTop;
+float g_d_Inv;
+
 // Global rendering parameters
 float g_renderScale = 0.0;
 int g_renderMaxSteps = 0;
@@ -58,13 +62,35 @@ int g_renderMaxSteps = 0;
 uint16_t stepsToColor(int steps, int maxSteps);
 void processWorkItem(WorkItem& item);
 
+void reset() {
+  // Clear screen
+  tft.fillScreen(TFT_BLACK);
+  memset(grid, 0, sizeof(grid));
+}
+
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
+  // Quick check: is the initial point inside known regions of the Mandelbrot set?
+
+  // Check main cardioid: the largest bulb of the Mandelbrot set
+  // Points inside the main cardioid are definitely in the set
+  float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+  if (q * (q + (x0 - 0.25)) < 0.25 * y0 * y0) {
+    return maxSteps;
+  }
+
+  // Check period-2 bulb: the circular region to the left of the main cardioid
+  // This is a circle centered at (-1, 0) with radius 0.25
+  if ((x0 + 1.0) * (x0 + 1.0) + y0 * y0 < 0.0625) {
+    return maxSteps;
+  }
+
   float x = 0.0;
   float y = 0.0;
   int steps = 0;
 
   while (steps < maxSteps) {
+
     float x2 = x * x;
     float y2 = y * y;
 
@@ -361,7 +387,13 @@ void workerTask(void* params) {
 // dm = width of window (height = dm * 17/32)
 void renderMandelbrot(const float xm, const float ym, const float dm, const int maxSteps) {
 
+  reset();
+
   g_calculating = true;
+
+  g_xTop = xm;
+  g_yTop = ym;
+  g_d_Inv = 1.0 / dm;
 
   unsigned long startTime = millis();
   g_curMaxSteps = maxSteps;
@@ -411,16 +443,16 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
 
   // Add initial work item to queue
 #if USE_OPTIMIZED_ALGORITHM
-  WorkItem initialItem;
-  initialItem.xi = 0;
-  initialItem.x = xm;
-  initialItem.nx = WIDTH;
-  initialItem.yi = 0;
-  initialItem.y = ym;
-  initialItem.ny = HEIGHT;
-  initialItem.d = g_renderScale;
-  initialItem.maxSteps = maxSteps;
-  xQueueSend(g_workQueue, &initialItem, 0);
+  WorkItem initialWorkItem;
+  initialWorkItem.xi = 0;
+  initialWorkItem.x = xm;
+  initialWorkItem.nx = WIDTH;
+  initialWorkItem.yi = 0;
+  initialWorkItem.y = ym;
+  initialWorkItem.ny = HEIGHT;
+  initialWorkItem.d = g_renderScale;
+  initialWorkItem.maxSteps = maxSteps;
+  xQueueSend(g_workQueue, &initialWorkItem, 0);
 #else
   // For naive algorithm, split into chunks for better distribution
   int chunkSize = 40; // Process in 40-pixel wide vertical strips
@@ -627,10 +659,6 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
-  // Clear screen
-  tft.fillScreen(TFT_BLACK);
-
-  Serial.println("Display initialized!");
   Serial.printf("TFT dimensions after rotation: %d x %d\n", tft.width(), tft.height());
   Serial.printf("Expected dimensions: %d x %d\n", WIDTH, HEIGHT);
 
