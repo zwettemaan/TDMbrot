@@ -70,38 +70,57 @@ void reset() {
 
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
-  // Quick check: is the initial point inside known regions of the Mandelbrot set?
+  // Use fixed-point arithmetic (8.24 format) for speed and precision
+  // Scale factor: 16777216 = 2^24
+  const int32_t SCALE = 16777216;
+  const int32_t FOUR = 4 * SCALE;
 
-  // Check main cardioid: the largest bulb of the Mandelbrot set
-  // Points inside the main cardioid are definitely in the set
-  float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
-  if (q * (q + (x0 - 0.25)) < 0.25 * y0 * y0) {
+  // Convert to fixed-point
+  int32_t cx = (int32_t)(x0 * SCALE);
+  int32_t cy = (int32_t)(y0 * SCALE);
+
+  // Quick check: main cardioid
+  // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
+  int64_t q_x = cx - (SCALE >> 2); // x0 - 0.25 (in 8.24 format)
+  int64_t q_x_sq = (q_x * q_x) >> 24; // (x-0.25)^2
+  int64_t cy_sq = ((int64_t)cy * cy) >> 24; // y^2
+  int64_t q = q_x_sq + cy_sq; // q = (x-0.25)^2 + y^2
+
+  // Check: q * (q + (x-0.25)) < 0.25 * y^2
+  int64_t lhs = (q * (q + q_x)) >> 24; // q * (q + (x-0.25))
+  int64_t rhs = cy_sq >> 2; // 0.25 * y^2
+  if (lhs < rhs) {
     return maxSteps;
   }
 
-  // Check period-2 bulb: the circular region to the left of the main cardioid
-  // This is a circle centered at (-1, 0) with radius 0.25
-  if ((x0 + 1.0) * (x0 + 1.0) + y0 * y0 < 0.0625) {
+  // Check period-2 bulb: (x0 + 1)^2 + y0^2 < 0.0625
+  int64_t bulb_x = cx + SCALE; // x0 + 1
+  int64_t bulb_x_sq = (bulb_x * bulb_x) >> 24;
+  int64_t bulb_dist = bulb_x_sq + cy_sq; // (x+1)^2 + y^2
+  if (bulb_dist < (SCALE >> 4)) { // 0.0625
     return maxSteps;
   }
 
-  float x = 0.0;
-  float y = 0.0;
+  int32_t x = 0;
+  int32_t y = 0;
   int steps = 0;
 
   while (steps < maxSteps) {
+    // x2 = x * x, y2 = y * y (need to scale back after multiply)
+    int64_t x2 = ((int64_t)x * x) >> 24;
+    int64_t y2 = ((int64_t)y * y) >> 24;
 
-    float x2 = x * x;
-    float y2 = y * y;
-
-    // Check if we've escaped (distance squared > 4)
-    if (x2 + y2 > 4.0) {
+    // Check if we've escaped (x^2 + y^2 > 4)
+    if (x2 + y2 > FOUR) {
       break;
     }
 
     // Mandelbrot iteration: z = z^2 + c
-    float xtemp = x2 - y2 + x0;
-    y = 2.0 * x * y + y0;
+    // xtemp = x^2 - y^2 + x0
+    int32_t xtemp = (int32_t)(x2 - y2) + cx;
+
+    // y = 2 * x * y + y0
+    y = (int32_t)((((int64_t)x * y) >> 23) + cy); // >>23 because 2*x*y
     x = xtemp;
 
     steps++;
@@ -149,11 +168,12 @@ void renderRegion(const int xi, const int yi, const int nx, const int ny) {
   if (g_coreId < 0) return; // Not in worker context
 
   bool hasSemaphore = false;
-  // Check if buffer is full BEFORE adding
+  // Check if buffer will be full AFTER adding this region
   if (g_pendingCount[g_coreId] >= MAX_PENDING_REGIONS) {
-    // Buffer full - must wait for mutex then flush
+    // Buffer full - must wait for mutex then flush first
     xSemaphoreTake(g_renderMutex, portMAX_DELAY);
     hasSemaphore = true;
+    flushPendingRegions(g_coreId);
   }
 
   // Add region to buffer
@@ -164,9 +184,9 @@ void renderRegion(const int xi, const int yi, const int nx, const int ny) {
   pr.ny = ny;
   g_pendingCount[g_coreId]++;
 
-  // Try to get mutex without blocking
+  // Try to get mutex without blocking (if we don't already have it)
   if (hasSemaphore || xSemaphoreTake(g_renderMutex, 0) == pdTRUE) {
-    // Got mutex - flush all pending regions
+    // Got mutex - flush all pending regions (including the one we just added)
     flushPendingRegions(g_coreId);
     xSemaphoreGive(g_renderMutex);
   }
@@ -299,6 +319,7 @@ void processWorkItem(WorkItem& item) {
         setGridPixel(xi + xi2, yi + yi2, n1);
       }
     }
+    asm volatile("" ::: "memory"); // Compiler barrier - ensure grid writes complete before render
     renderRegion(xi, yi, nx, ny);
     return;
   }
@@ -644,8 +665,8 @@ void setup() {
   // Create mutex for thread-safe rendering
   g_renderMutex = xSemaphoreCreateMutex();
 
-  // Create work queue (holds up to 100 work items)
-  g_workQueue = xQueueCreate(100, sizeof(WorkItem));
+  // Create work queue (holds up to 200 work items for better distribution)
+  g_workQueue = xQueueCreate(200, sizeof(WorkItem));
 
   // Initialize buttons
   pinMode(BUTTON_1, INPUT_PULLUP);
