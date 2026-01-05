@@ -18,6 +18,16 @@ TFT_eSPI tft = TFT_eSPI();
 #define WIDTH 320
 #define HEIGHT 170
 
+// ============================================================================
+// Fixed-point arithmetic (8.24 format) - 8 integer bits, 24 fractional bits
+// ============================================================================
+#define FP_SHIFT 24
+#define FP_SCALE 16777216  // 2^24
+
+// Type aliases for fixed-point numbers
+typedef int32_t TFixedPoint;      // Standard fixed-point (8.24)
+typedef int64_t TWideFixedPoint;  // Wide fixed-point for intermediate results
+
 // Grid to store Mandelbrot iteration counts
 uint16_t grid[WIDTH][HEIGHT];
 
@@ -41,14 +51,14 @@ volatile int g_busyWorkers = 0;
 
 // Work item structure for the queue
 struct WorkItem {
-  int xi;       // Grid start X
-  int32_t x;    // World X coordinate (fixed-point)
-  int nx;       // Number of X pixels
-  int yi;       // Grid start Y
-  int32_t y;    // World Y coordinate (fixed-point)
-  int ny;       // Number of Y pixels
-  int32_t d;    // World scale (fixed-point)
-  int maxSteps; // Max iterations
+  int xi;           // Grid start X
+  TFixedPoint x;    // World X coordinate (fixed-point)
+  int nx;           // Number of X pixels
+  int yi;           // Grid start Y
+  TFixedPoint y;    // World Y coordinate (fixed-point)
+  int ny;           // Number of Y pixels
+  TFixedPoint d;    // World scale (fixed-point)
+  int maxSteps;     // Max iterations
 };
 
 float g_xTop;
@@ -62,62 +72,71 @@ int g_renderMaxSteps = 0;
 uint16_t stepsToColor(int steps, int maxSteps);
 void processWorkItem(WorkItem& item);
 
-// ============================================================================
-// Fixed-point arithmetic (8.24 format) - 8 integer bits, 24 fractional bits
-// ============================================================================
-#define FP_SHIFT 24
-#define FP_SCALE 16777216  // 2^24
-
 // Convert float to fixed-point
-inline int32_t toFixed(float value) {
-  return (int32_t)(value * FP_SCALE);
+inline TFixedPoint toFixed(float value) {
+  return (TFixedPoint)(value * FP_SCALE);
 }
 
 // Convert float constant to fixed-point at compile time
-#define FP_CONST(x) ((int32_t)((x) * FP_SCALE))
+#define FP_CONST(x) ((TFixedPoint)((x) * FP_SCALE))
 
-// Multiply two fixed-point numbers (returns fixed-point)
-inline int64_t fpMul(int32_t a, int32_t b) {
-  return ((int64_t)a * b) >> FP_SHIFT;
+// Multiply two fixed-point numbers (returns wide fixed-point)
+inline TWideFixedPoint fpMul(TFixedPoint a, TFixedPoint b) {
+  return ((TWideFixedPoint)a * b) >> FP_SHIFT;
 }
 
 // Multiply two fixed-point numbers with double shift (for 2*x*y operations)
-inline int64_t fpMul2(int32_t a, int32_t b) {
-  return ((int64_t)a * b) >> (FP_SHIFT - 1);
+inline TWideFixedPoint fpMul2(TFixedPoint a, TFixedPoint b) {
+  return ((TWideFixedPoint)a * b) >> (FP_SHIFT - 1);
 }
 
-// Square a fixed-point number (returns fixed-point)
-inline int64_t fpSquare(int32_t value) {
+// Square a fixed-point number (returns wide fixed-point)
+inline TWideFixedPoint fpSquare(TFixedPoint value) {
   return fpMul(value, value);
 }
 
 // Add two fixed-point numbers
-inline int64_t fpAdd(int64_t a, int64_t b) {
+inline TFixedPoint fpAdd(TFixedPoint a, TFixedPoint b) {
+  return a + b;
+}
+
+// Add two wide fixed-point numbers
+inline TWideFixedPoint fpAdd(TWideFixedPoint a, TWideFixedPoint b) {
+  return a + b;
+}
+
+// Add fixed-point to wide fixed-point
+inline TWideFixedPoint fpAdd(TWideFixedPoint a, TFixedPoint b) {
   return a + b;
 }
 
 // Subtract two fixed-point numbers
-inline int64_t fpSub(int64_t a, int64_t b) {
+inline TFixedPoint fpSub(TFixedPoint a, TFixedPoint b) {
+  return a - b;
+}
+
+// Subtract two wide fixed-point numbers
+inline TWideFixedPoint fpSub(TWideFixedPoint a, TWideFixedPoint b) {
   return a - b;
 }
 
 // Check if a point is inside the Mandelbrot set (main cardioid or period-2 bulb)
 // Returns true if the point is definitely inside the set
-inline bool isInsideOfSet(int32_t px, int32_t py) {
+inline bool isInsideOfSet(TFixedPoint px, TFixedPoint py) {
   // Calculate squares once
-  const int64_t px2 = fpSquare(px);
-  const int64_t py2 = fpSquare(py);
+  const TWideFixedPoint px2 = fpSquare(px);
+  const TWideFixedPoint py2 = fpSquare(py);
 
   // Quick check: main cardioid
   // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
   // Expanded: q = (x-0.25)^2 + y^2 = x^2 - 0.5*x + 0.0625 + y^2
   // Reuse calculated x^2 and y^2 to avoid redundant computation
-  const int64_t q_x = px - FP_CONST(0.25);
-  const int64_t q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
+  const TWideFixedPoint q_x = px - FP_CONST(0.25);
+  const TWideFixedPoint q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
 
   // Check: q * (q + (x-0.25)) < 0.25 * y^2
-  const int64_t cardioid_lhs = fpMul(q, fpAdd(q, q_x));
-  const int64_t cardioid_rhs = py2 >> 2;  // Divide by 4 = multiply by 0.25
+  const TWideFixedPoint cardioid_lhs = fpMul(q, fpAdd(q, q_x));
+  const TWideFixedPoint cardioid_rhs = py2 >> 2;  // Divide by 4 = multiply by 0.25
   if (cardioid_lhs < cardioid_rhs) {
     return true;
   }
@@ -125,7 +144,7 @@ inline bool isInsideOfSet(int32_t px, int32_t py) {
   // Check period-2 bulb: (x + 1)^2 + y^2 < 0.0625
   // Expand: (x + 1)^2 + y^2 = x^2 + 2*x + 1 + y^2
   // Reuse pre-calculated squares
-  const int64_t bulb_dist = px2 + py2 + (px << 1) + FP_SCALE;  // px<<1 is 2*x
+  const TWideFixedPoint bulb_dist = px2 + py2 + (px << 1) + FP_SCALE;  // px<<1 is 2*x
   if (bulb_dist < FP_CONST(0.0625)) {
     return true;
   }
@@ -140,21 +159,21 @@ void reset() {
 }
 
 // Calculate number of steps for Mandelbrot iteration
-int nSteps(int32_t cx, int32_t cy, int maxSteps) {
+int nSteps(TFixedPoint cx, TFixedPoint cy, int maxSteps) {
   // Quick check on initial point (c value only, not iterated z)
   if (isInsideOfSet(cx, cy)) {
     return maxSteps;
   }
 
   // Mandelbrot iteration
-  int32_t x = 0;
-  int32_t y = 0;
+  TFixedPoint x = 0;
+  TFixedPoint y = 0;
   int steps = 0;
 
   while (steps < maxSteps) {
-    // Calculate squares
-    const int64_t x2 = fpSquare(x);
-    const int64_t y2 = fpSquare(y);
+    // Calculate squares (safe to cast since we check for escape at 4)
+    const TFixedPoint x2 = (TFixedPoint)fpSquare(x);
+    const TFixedPoint y2 = (TFixedPoint)fpSquare(y);
 
     // Check if we've escaped (x^2 + y^2 > 4)
     if (fpAdd(x2, y2) > FP_CONST(4.0)) {
@@ -162,8 +181,8 @@ int nSteps(int32_t cx, int32_t cy, int maxSteps) {
     }
 
     // Mandelbrot iteration: z = z^2 + c
-    const int32_t xtemp = (int32_t)fpAdd(fpSub(x2, y2), cx);
-    y = (int32_t)fpAdd(fpMul2(x, y), cy);
+    const TFixedPoint xtemp = fpAdd(fpSub(x2, y2), cx);
+    y = (TFixedPoint)fpAdd(fpMul2(x, y), cy);
     x = xtemp;
 
     steps++;
@@ -271,7 +290,7 @@ uint16_t stepsToColor(const int steps, const int maxSteps) {
 }
 
 // Helper to add work item to queue or process directly if queue is full
-void enqueueOrProcess(const int xi, const int32_t x, const int nx, const int yi, const int32_t y, const int ny, const int32_t d, const int maxSteps) {
+void enqueueOrProcess(const int xi, const TFixedPoint x, const int nx, const int yi, const TFixedPoint y, const int ny, const TFixedPoint d, const int maxSteps) {
   WorkItem item = {xi, x, nx, yi, y, ny, d, maxSteps};
 
   // If queue has space, enqueue
@@ -295,8 +314,8 @@ void processWorkItem(WorkItem& item) {
 
   const int xi = item.xi;
   const int yi = item.yi;
-  const int32_t x = item.x;
-  const int32_t y = item.y;
+  const TFixedPoint x = item.x;
+  const TFixedPoint y = item.y;
   const int maxSteps = item.maxSteps;
 
   if (nx == 1 && ny == 1) {
@@ -306,7 +325,7 @@ void processWorkItem(WorkItem& item) {
     return;
   }
 
-  const int32_t d = item.d;
+  const TFixedPoint d = item.d;
 
   if (nx == 1) {
     const int n1 = nSteps(x, y, maxSteps);
@@ -417,11 +436,11 @@ void workerTask(void* params) {
       processWorkItem(item);
 #else
       // Naive algorithm - just calculate the region
-      int32_t scale = item.d;
+      TFixedPoint scale = item.d;
       for (int xi = item.xi; xi < item.xi + item.nx; xi++) {
         for (int yi = item.yi; yi < item.yi + item.ny; yi++) {
-          int32_t x = item.x + (xi - item.xi) * scale;
-          int32_t y = item.y + (yi - item.yi) * scale;
+          TFixedPoint x = item.x + (xi - item.xi) * scale;
+          TFixedPoint y = item.y + (yi - item.yi) * scale;
           int n = nSteps(x, y, item.maxSteps);
           setGridPixel(xi, yi, n);
         }
@@ -520,9 +539,9 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
 #else
   // For naive algorithm, split into chunks for better distribution
   int chunkSize = 40; // Process in 40-pixel wide vertical strips
-  int32_t xm_fp = toFixed(xm);
-  int32_t ym_fp = toFixed(ym);
-  int32_t scale_fp = toFixed(g_renderScale);
+  TFixedPoint xm_fp = toFixed(xm);
+  TFixedPoint ym_fp = toFixed(ym);
+  TFixedPoint scale_fp = toFixed(g_renderScale);
   for (int xi = 0; xi < WIDTH; xi += chunkSize) {
     int nx = min(chunkSize, WIDTH - xi);
     WorkItem item;
