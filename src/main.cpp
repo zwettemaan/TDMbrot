@@ -14,9 +14,9 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// Display dimensions in landscape mode
-#define WIDTH 320
-#define HEIGHT 170
+// Display dimensions in portrait mode
+#define WIDTH 170
+#define HEIGHT 320
 
 // ============================================================================
 // Fixed-point arithmetic (8.24 format) - 8 integer bits, 24 fractional bits
@@ -39,7 +39,30 @@ float g_xm = -0.770;
 float g_ym = 0.095;
 float g_dm = 0.01;
 bool g_calculating = false;
-const int c_maxSteps = 1000;
+
+// Maximum iteration count
+const int c_maxIterations = 10000;
+
+// Calculate max steps based on zoom level
+int calculateMaxSteps(float dm) {
+  // Base iteration count
+  const int baseSteps = 200;
+  
+  // Calculate zoom depth (smaller dm = deeper zoom)
+  // Initial dm is around 4.0 (full view), zooming in makes it smaller
+  float zoomDepth = log(4.0 / dm) / log(2.0);  // log2 of zoom factor
+  
+  // Increase steps as we zoom in
+  // Add 50 steps per doubling of zoom
+  int additionalSteps = (int)(zoomDepth * 50);
+  
+  // Cap at maximum to avoid very slow renders
+  int maxSteps = baseSteps + additionalSteps;
+  if (maxSteps > c_maxIterations) maxSteps = c_maxIterations;
+  if (maxSteps < baseSteps) maxSteps = baseSteps;
+  
+  return maxSteps;
+}
 
 // Multi-core work queue system
 SemaphoreHandle_t g_renderMutex = NULL;
@@ -467,7 +490,7 @@ void workerTask(void* params) {
 
 // Calculate and render Mandelbrot set
 // xm, ym = top-left corner of window
-// dm = width of window (height = dm * 17/32)
+// dm = width of window (height = dm * 320/170)
 void renderMandelbrot(const float xm, const float ym, const float dm, const int maxSteps) {
 
   reset();
@@ -481,8 +504,8 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
   unsigned long startTime = millis();
   g_curMaxSteps = maxSteps;
 
-  float window_height = dm * 17.0 / 32.0;
-  Serial.printf("Calculating Mandelbrot: top-left=(%.4f, %.4f), width=%.4f, height=%.4f\n", xm, ym, dm, window_height);
+  float window_height = dm * 320.0 / 170.0;
+  Serial.printf("Calculating Mandelbrot: top-left=(%.4f, %.4f), width=%.4f, height=%.4f, maxSteps=%d\n", xm, ym, dm, window_height, maxSteps);
   Serial.printf("Render mode: %s\n", RENDER_WHILE_CALCULATING ? "while-calculating" : "post-render");
   Serial.printf("Algorithm: %s\n", USE_OPTIMIZED_ALGORITHM ? "optimized-recursive" : "naive-loop");
   Serial.println("Using queue-based dual-core rendering");
@@ -494,7 +517,7 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
 
   g_activeWorkers = 0;
   g_busyWorkers = 0;
-  g_renderScale = dm / 320.0;
+  g_renderScale = dm / 170.0;
   g_renderMaxSteps = maxSteps;
 
   // Reset pending region buffers
@@ -584,20 +607,110 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
   g_calculating = false;
 }
 
-// Button handling
-unsigned long button1PressTime = 0;
-unsigned long button2PressTime = 0;
+// Menu system for button handling
+enum MenuState {
+  MENU_NONE,      // No menu active
+  MENU_DIRECTION, // Direction selection menu
+  MENU_ZOOM       // Zoom selection menu
+};
+
+MenuState g_menuState = MENU_NONE;
+int g_menuSelection = 0; // Current selection index (0-3)
+
+// Direction options: North, East, South, West
+const char* g_directions[] = {"N", "E", "S", "W"};
+const float g_directionOffsets[][2] = {
+  {0.0, -0.5},   // N: shift up
+  {0.5, 0.0},    // E: shift right
+  {0.0, 0.5},    // S: shift down
+  {-0.5, 0.0}    // W: shift left
+};
+
+// Zoom options
+const float g_zoomFactors[] = {0.5, 0.75, 1.5, 2.0};
+
+// Button state
 bool button1WasPressed = false;
 bool button2WasPressed = false;
-unsigned long button1ReleaseTime = 0;
-unsigned long button2ReleaseTime = 0;
-bool button1PendingSingle = false;
-bool button2PendingSingle = false;
-bool button1DoubleInProgress = false;
-bool button2DoubleInProgress = false;
 
-#define LONG_PRESS_TIME 500
-#define DOUBLE_PRESS_TIME 300
+// Draw direction selection menu
+void drawDirectionMenu() {
+  
+  // Draw title text
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(10, 10);
+  tft.println("left button = pick");
+  tft.setCursor(10, 20);
+  tft.println("right button = action");
+  
+  // Draw directional arrows/labels in compass layout
+  const int centerX = WIDTH / 2;
+  const int centerY = HEIGHT / 2;
+  const int spacing = 40;
+  
+  // Positions: N, E, S, W
+  const int positions[][2] = {
+    {centerX, centerY - spacing},      // N
+    {centerX + spacing, centerY},      // E
+    {centerX, centerY + spacing},      // S
+    {centerX - spacing, centerY}       // W
+  };
+  
+  for (int i = 0; i < 4; i++) {
+    int x = positions[i][0];
+    int y = positions[i][1];
+    
+    // Draw box around selected item
+    if (i == g_menuSelection) {
+      tft.fillRect(x - 15, y - 10, 30, 20, TFT_GREEN);
+      tft.setTextColor(TFT_BLACK, TFT_GREEN);
+    } else {
+      tft.fillRect(x - 15, y - 10, 30, 20, TFT_DARKGREY);
+      tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    }
+    
+    // Draw direction label centered
+    tft.setTextSize(2);
+    tft.setCursor(x - 6, y - 8);
+    tft.print(g_directions[i]);
+  }
+}
+
+// Draw zoom selection menu
+void drawZoomMenu() {
+  
+  // Draw title text
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(10, 10);
+  tft.println("left button = pick");
+  tft.setCursor(10, 20);
+  tft.println("right button = action");
+  
+  // Draw zoom options in a grid
+  const int startY = 60;
+  const int spacing = 35;
+  
+  for (int i = 0; i < 4; i++) {
+    int x = WIDTH / 2 - 30;
+    int y = startY + i * spacing;
+    
+    // Draw box around selected item
+    if (i == g_menuSelection) {
+      tft.fillRect(x - 5, y - 5, 70, 25, TFT_GREEN);
+      tft.setTextColor(TFT_BLACK, TFT_GREEN);
+    } else {
+      tft.fillRect(x - 5, y - 5, 70, 25, TFT_DARKGREY);
+      tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    }
+    
+    // Draw zoom factor
+    tft.setTextSize(2);
+    tft.setCursor(x, y);
+    tft.printf("%.2fx", g_zoomFactors[i]);
+  }
+}
 
 void handleButtons() {
   if (g_calculating) return; // Ignore buttons while calculating
@@ -605,121 +718,80 @@ void handleButtons() {
   bool btn1 = digitalRead(BUTTON_1) == LOW;
   bool btn2 = digitalRead(BUTTON_2) == LOW;
 
-  // Check for pending single presses that have timed out
-  if (button1PendingSingle && (millis() - button1ReleaseTime >= DOUBLE_PRESS_TIME)) {
-    Serial.println("Button 1 single press: Shift left");
-    g_xm -= g_dm / 2.0;
-    renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-    button1PendingSingle = false;
-    button1ReleaseTime = 0;
-  }
-
-  if (button2PendingSingle && (millis() - button2ReleaseTime >= DOUBLE_PRESS_TIME)) {
-    Serial.println("Button 2 single press: Shift right");
-    g_xm += g_dm / 2.0;
-    renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-    button2PendingSingle = false;
-    button2ReleaseTime = 0;
-  }
-
-  // Button 1 handling
+  // Button 1 (left) - pressed
   if (btn1 && !button1WasPressed) {
-    button1PressTime = millis();
     button1WasPressed = true;
-
-    // Check if this is a double press
-    if (button1PendingSingle && (millis() - button1ReleaseTime < DOUBLE_PRESS_TIME)) {
-      // Double press detected - set flag for when button is released
-      button1DoubleInProgress = true;
-      button1PendingSingle = false;
-      button1ReleaseTime = 0;
+    
+    if (g_menuState == MENU_NONE) {
+      // First press - open zoom menu
+      g_menuState = MENU_ZOOM;
+      g_menuSelection = 0;
+      drawZoomMenu();
+    } else if (g_menuState == MENU_ZOOM) {
+      // Cycle through zoom selections
+      g_menuSelection = (g_menuSelection + 1) % 4;
+      drawZoomMenu();
+    } else if (g_menuState == MENU_DIRECTION) {
+      // Execute direction shift (opposite button from the one that opened the menu)
+      float offsetX = g_directionOffsets[g_menuSelection][0] * g_dm;
+      float offsetY = g_directionOffsets[g_menuSelection][1] * g_dm * 320.0 / 170.0;
+      
+      g_xm += offsetX;
+      g_ym += offsetY;
+      
+      g_menuState = MENU_NONE;
+      Serial.printf("Shifting %s\n", g_directions[g_menuSelection]);
+      renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
     }
   } else if (!btn1 && button1WasPressed) {
-    unsigned long pressDuration = millis() - button1PressTime;
     button1WasPressed = false;
-
-    if (pressDuration >= LONG_PRESS_TIME) {
-      // Long press: zoom in
-      Serial.println("Button 1 long press: Zoom in");
-      button1PendingSingle = false;
-      button1DoubleInProgress = false;
-      button1ReleaseTime = 0;
-      g_dm /= 2.0;
-      g_xm += g_dm / 2.0;
-      g_ym += (g_dm * 17.0 / 32.0) / 2.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-    } else if (button1DoubleInProgress) {
-      // This was a double press
-      Serial.println("Button 1 double press: Shift up");
-      button1DoubleInProgress = false;
-      button1PendingSingle = false;
-      button1ReleaseTime = 0;
-      g_ym -= g_dm / 2.0 * 17.0 / 32.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-    } else {
-      // Mark as pending single press
-      button1PendingSingle = true;
-      button1ReleaseTime = millis();
-    }
   }
 
-  // Button 2 handling
+  // Button 2 (right) - pressed
   if (btn2 && !button2WasPressed) {
-    button2PressTime = millis();
     button2WasPressed = true;
-
-    // Check if this is a double press
-    if (button2PendingSingle && (millis() - button2ReleaseTime < DOUBLE_PRESS_TIME)) {
-      // Double press detected - set flag for when button is released
-      button2DoubleInProgress = true;
-      button2PendingSingle = false;
-      button2ReleaseTime = 0;
+    
+    if (g_menuState == MENU_NONE) {
+      // First press - open direction menu
+      g_menuState = MENU_DIRECTION;
+      g_menuSelection = 0;
+      drawDirectionMenu();
+    } else if (g_menuState == MENU_DIRECTION) {
+      // Cycle through direction selections
+      g_menuSelection = (g_menuSelection + 1) % 4;
+      drawDirectionMenu();
+    } else if (g_menuState == MENU_ZOOM) {
+      // Execute zoom (opposite button from the one that opened the menu)
+      float zoomFactor = g_zoomFactors[g_menuSelection];
+      float centerX = g_xm + g_dm / 2.0;
+      float centerY = g_ym + (g_dm * 320.0 / 170.0) / 2.0;
+      
+      float new_dm = g_dm / zoomFactor;
+      
+      // Check if zoom would exceed fixed-point precision
+      // With 8.24 format, minimum representable step is 1/2^24 ≈ 6e-8
+      // We need at least 2 units per pixel step for safety
+      float newScale = new_dm / 170.0;
+      float minScale = 2.0 / FP_SCALE;  // Minimum safe scale
+      
+      if (newScale < minScale) {
+        Serial.printf("Zoom limit reached - scale %.2e would be below fixed-point precision %.2e\n", newScale, minScale);
+        g_menuState = MENU_NONE;
+        renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
+        return;
+      }
+      
+      // Recalculate top-left to keep center stable
+      g_dm = new_dm;
+      g_xm = centerX - g_dm / 2.0;
+      g_ym = centerY - (g_dm * 320.0 / 170.0) / 2.0;
+      
+      g_menuState = MENU_NONE;
+      Serial.printf("Zooming by %.2fx\n", zoomFactor);
+      renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
     }
   } else if (!btn2 && button2WasPressed) {
-    unsigned long pressDuration = millis() - button2PressTime;
     button2WasPressed = false;
-
-    if (pressDuration >= LONG_PRESS_TIME) {
-      // Long press: zoom out
-      Serial.println("Button 2 long press: Zoom out");
-      button2PendingSingle = false;
-      button2DoubleInProgress = false;
-      button2ReleaseTime = 0;
-      float new_dm = g_dm * 2.0;
-
-      // Check if corners would go outside [-2, 2] range
-      float new_x_end = g_xm + new_dm;
-      float new_y_end = g_ym + new_dm * 17.0 / 32.0;
-
-      // Constrain to keep all corners in [-2, 2]
-      if (g_xm >= -2.0 && new_x_end <= 2.0 && g_ym >= -2.0 && new_y_end <= 2.0) {
-        g_dm = new_dm;
-        g_xm -= g_dm / 4.0;
-        g_ym -= (g_dm * 17.0 / 32.0) / 4.0;
-
-        // Clamp to boundaries
-        if (g_xm < -2.0) g_xm = -2.0;
-        if (g_ym < -2.0) g_ym = -2.0;
-        if (g_xm + g_dm > 2.0) g_xm = 2.0 - g_dm;
-        if (g_ym + g_dm * 17.0 / 32.0 > 2.0) g_ym = 2.0 - g_dm * 17.0 / 32.0;
-
-        renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-      } else {
-        Serial.println("Zoom out limited: would exceed bounds");
-      }
-    } else if (button2DoubleInProgress) {
-      // This was a double press
-      Serial.println("Button 2 double press: Shift down");
-      button2DoubleInProgress = false;
-      button2PendingSingle = false;
-      button2ReleaseTime = 0;
-      g_ym += g_dm / 2.0 * 17.0 / 32.0;
-      renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
-    } else {
-      // Mark as pending single press
-      button2PendingSingle = true;
-      button2ReleaseTime = millis();
-    }
   }
 }
 
@@ -739,7 +811,7 @@ void setup() {
 
   // Initialize the display
   tft.init();
-  tft.setRotation(1); // Landscape orientation (320x170)
+  tft.setRotation(0); // Portrait orientation (170x320)
 
   // Turn on backlight
   pinMode(TFT_BL, OUTPUT);
@@ -749,16 +821,12 @@ void setup() {
   Serial.printf("Expected dimensions: %d x %d\n", WIDTH, HEIGHT);
 
   // Initial render with current global parameters
-  renderMandelbrot(g_xm, g_ym, g_dm, c_maxSteps);
+  renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
 
   Serial.println("Mandelbrot rendering complete!");
   Serial.println("Button controls:");
-  Serial.println("  Button 1 single: Shift left");
-  Serial.println("  Button 2 single: Shift right");
-  Serial.println("  Button 1 double: Shift up");
-  Serial.println("  Button 2 double: Shift down");
-  Serial.println("  Button 1 long: Zoom in");
-  Serial.println("  Button 2 long: Zoom out");
+  Serial.println("  Left button: Open zoom menu, cycle through zoom options, right button executes");
+  Serial.println("  Right button: Open direction menu, cycle through directions, left button executes");
 }
 
 void loop() {
