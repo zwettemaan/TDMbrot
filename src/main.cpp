@@ -62,6 +62,74 @@ int g_renderMaxSteps = 0;
 uint16_t stepsToColor(int steps, int maxSteps);
 void processWorkItem(WorkItem& item);
 
+// ============================================================================
+// Fixed-point arithmetic (8.24 format) - 8 integer bits, 24 fractional bits
+// ============================================================================
+#define FP_SHIFT 24
+#define FP_SCALE 16777216  // 2^24
+
+// Convert float to fixed-point
+inline int32_t toFixed(float value) {
+  return (int32_t)(value * FP_SCALE);
+}
+
+// Convert float constant to fixed-point at compile time
+#define FP_CONST(x) ((int32_t)((x) * FP_SCALE))
+
+// Multiply two fixed-point numbers (returns fixed-point)
+inline int64_t fpMul(int32_t a, int32_t b) {
+  return ((int64_t)a * b) >> FP_SHIFT;
+}
+
+// Multiply two fixed-point numbers with double shift (for 2*x*y operations)
+inline int64_t fpMul2(int32_t a, int32_t b) {
+  return ((int64_t)a * b) >> (FP_SHIFT - 1);
+}
+
+// Square a fixed-point number (returns fixed-point)
+inline int64_t fpSquare(int32_t value) {
+  return fpMul(value, value);
+}
+
+// Add two fixed-point numbers
+inline int64_t fpAdd(int64_t a, int64_t b) {
+  return a + b;
+}
+
+// Subtract two fixed-point numbers
+inline int64_t fpSub(int64_t a, int64_t b) {
+  return a - b;
+}
+
+// Check if a point is inside the Mandelbrot set (main cardioid or period-2 bulb)
+// Returns true if the point is definitely inside the set
+// px2 and py2 are pre-calculated squares to avoid redundant computation
+inline bool isInsideOfSet(int32_t px, int32_t py, int64_t px2, int64_t py2) {
+  // Quick check: main cardioid
+  // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
+  // Expanded: q = (x-0.25)^2 + y^2 = x^2 - 0.5*x + 0.0625 + y^2
+  // Reuse pre-calculated x^2 and y^2 to avoid redundant computation
+  const int64_t q_x = px - FP_CONST(0.25);
+  const int64_t q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
+
+  // Check: q * (q + (x-0.25)) < 0.25 * y^2
+  const int64_t cardioid_lhs = fpMul(q, fpAdd(q, q_x));
+  const int64_t cardioid_rhs = py2 >> 2;  // Divide by 4 = multiply by 0.25
+  if (cardioid_lhs < cardioid_rhs) {
+    return true;
+  }
+
+  // Check period-2 bulb: (x + 1)^2 + y^2 < 0.0625
+  // Expand: (x + 1)^2 + y^2 = x^2 + 2*x + 1 + y^2
+  // Reuse pre-calculated squares
+  const int64_t bulb_dist = px2 + py2 + (px << 1) + FP_SCALE;  // px<<1 is 2*x
+  if (bulb_dist < FP_CONST(0.0625)) {
+    return true;
+  }
+
+  return false;
+}
+
 void reset() {
   // Clear screen
   tft.fillScreen(TFT_BLACK);
@@ -70,60 +138,40 @@ void reset() {
 
 // Calculate number of steps for Mandelbrot iteration
 int nSteps(float x0, float y0, int maxSteps) {
-  // Use fixed-point arithmetic (8.24 format) for speed and precision
-  // Scale factor: 16777216 = 2^24
-  const int32_t SCALE = 16777216;
-  const int32_t FOUR = 4 * SCALE;
-
   // Convert to fixed-point
-  int32_t cx = (int32_t)(x0 * SCALE);
-  int32_t cy = (int32_t)(y0 * SCALE);
+  const int32_t cx = toFixed(x0);
+  const int32_t cy = toFixed(y0);
 
-  // Quick check: main cardioid
-  // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
-  int64_t q_x = cx - (SCALE >> 2); // x0 - 0.25 (in 8.24 format)
-  int64_t q_x_sq = (q_x * q_x) >> 24; // (x-0.25)^2
-  int64_t cy_sq = ((int64_t)cy * cy) >> 24; // y^2
-  int64_t q = q_x_sq + cy_sq; // q = (x-0.25)^2 + y^2
-
-  // Check: q * (q + (x-0.25)) < 0.25 * y^2
-  int64_t lhs = (q * (q + q_x)) >> 24; // q * (q + (x-0.25))
-  int64_t rhs = cy_sq >> 2; // 0.25 * y^2
-  if (lhs < rhs) {
+  // Quick check on initial point (c value only, not iterated z)
+  const int64_t cx2 = fpSquare(cx);
+  const int64_t cy2 = fpSquare(cy);
+  if (isInsideOfSet(cx, cy, cx2, cy2)) {
     return maxSteps;
   }
 
-  // Check period-2 bulb: (x0 + 1)^2 + y0^2 < 0.0625
-  int64_t bulb_x = cx + SCALE; // x0 + 1
-  int64_t bulb_x_sq = (bulb_x * bulb_x) >> 24;
-  int64_t bulb_dist = bulb_x_sq + cy_sq; // (x+1)^2 + y^2
-  if (bulb_dist < (SCALE >> 4)) { // 0.0625
-    return maxSteps;
-  }
-
+  // Mandelbrot iteration
   int32_t x = 0;
   int32_t y = 0;
+  int64_t x2 = 0;
+  int64_t y2 = 0;
   int steps = 0;
 
   while (steps < maxSteps) {
-    // x2 = x * x, y2 = y * y (need to scale back after multiply)
-    int64_t x2 = ((int64_t)x * x) >> 24;
-    int64_t y2 = ((int64_t)y * y) >> 24;
-
     // Check if we've escaped (x^2 + y^2 > 4)
-    if (x2 + y2 > FOUR) {
+    if (fpAdd(x2, y2) > FP_CONST(4.0)) {
       break;
     }
 
     // Mandelbrot iteration: z = z^2 + c
-    // xtemp = x^2 - y^2 + x0
-    int32_t xtemp = (int32_t)(x2 - y2) + cx;
-
-    // y = 2 * x * y + y0
-    y = (int32_t)((((int64_t)x * y) >> 23) + cy); // >>23 because 2*x*y
+    const int32_t xtemp = (int32_t)fpAdd(fpSub(x2, y2), cx);
+    y = (int32_t)fpAdd(fpMul2(x, y), cy);
     x = xtemp;
 
     steps++;
+
+    // Calculate squares for the new position (will be used in next iteration)
+    x2 = fpSquare(x);
+    y2 = fpSquare(y);
   }
 
   return steps;
