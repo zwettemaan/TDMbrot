@@ -42,12 +42,12 @@ volatile int g_busyWorkers = 0;
 // Work item structure for the queue
 struct WorkItem {
   int xi;       // Grid start X
-  float x;      // World X coordinate
+  int32_t x;    // World X coordinate (fixed-point)
   int nx;       // Number of X pixels
   int yi;       // Grid start Y
-  float y;      // World Y coordinate
+  int32_t y;    // World Y coordinate (fixed-point)
   int ny;       // Number of Y pixels
-  float d;      // World scale
+  int32_t d;    // World scale (fixed-point)
   int maxSteps; // Max iterations
 };
 
@@ -103,12 +103,15 @@ inline int64_t fpSub(int64_t a, int64_t b) {
 
 // Check if a point is inside the Mandelbrot set (main cardioid or period-2 bulb)
 // Returns true if the point is definitely inside the set
-// px2 and py2 are pre-calculated squares to avoid redundant computation
-inline bool isInsideOfSet(int32_t px, int32_t py, int64_t px2, int64_t py2) {
+inline bool isInsideOfSet(int32_t px, int32_t py) {
+  // Calculate squares once
+  const int64_t px2 = fpSquare(px);
+  const int64_t py2 = fpSquare(py);
+
   // Quick check: main cardioid
   // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
   // Expanded: q = (x-0.25)^2 + y^2 = x^2 - 0.5*x + 0.0625 + y^2
-  // Reuse pre-calculated x^2 and y^2 to avoid redundant computation
+  // Reuse calculated x^2 and y^2 to avoid redundant computation
   const int64_t q_x = px - FP_CONST(0.25);
   const int64_t q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
 
@@ -137,26 +140,22 @@ void reset() {
 }
 
 // Calculate number of steps for Mandelbrot iteration
-int nSteps(float x0, float y0, int maxSteps) {
-  // Convert to fixed-point
-  const int32_t cx = toFixed(x0);
-  const int32_t cy = toFixed(y0);
-
+int nSteps(int32_t cx, int32_t cy, int maxSteps) {
   // Quick check on initial point (c value only, not iterated z)
-  const int64_t cx2 = fpSquare(cx);
-  const int64_t cy2 = fpSquare(cy);
-  if (isInsideOfSet(cx, cy, cx2, cy2)) {
+  if (isInsideOfSet(cx, cy)) {
     return maxSteps;
   }
 
   // Mandelbrot iteration
   int32_t x = 0;
   int32_t y = 0;
-  int64_t x2 = 0;
-  int64_t y2 = 0;
   int steps = 0;
 
   while (steps < maxSteps) {
+    // Calculate squares
+    const int64_t x2 = fpSquare(x);
+    const int64_t y2 = fpSquare(y);
+
     // Check if we've escaped (x^2 + y^2 > 4)
     if (fpAdd(x2, y2) > FP_CONST(4.0)) {
       break;
@@ -168,10 +167,6 @@ int nSteps(float x0, float y0, int maxSteps) {
     x = xtemp;
 
     steps++;
-
-    // Calculate squares for the new position (will be used in next iteration)
-    x2 = fpSquare(x);
-    y2 = fpSquare(y);
   }
 
   return steps;
@@ -276,7 +271,7 @@ uint16_t stepsToColor(const int steps, const int maxSteps) {
 }
 
 // Helper to add work item to queue or process directly if queue is full
-void enqueueOrProcess(const int xi, const float x, const int nx, const int yi, const float y, const int ny, const float d, const int maxSteps) {
+void enqueueOrProcess(const int xi, const int32_t x, const int nx, const int yi, const int32_t y, const int ny, const int32_t d, const int maxSteps) {
   WorkItem item = {xi, x, nx, yi, y, ny, d, maxSteps};
 
   // If queue has space, enqueue
@@ -300,8 +295,8 @@ void processWorkItem(WorkItem& item) {
 
   const int xi = item.xi;
   const int yi = item.yi;
-  const float x = item.x;
-  const float y = item.y;
+  const int32_t x = item.x;
+  const int32_t y = item.y;
   const int maxSteps = item.maxSteps;
 
   if (nx == 1 && ny == 1) {
@@ -311,11 +306,11 @@ void processWorkItem(WorkItem& item) {
     return;
   }
 
-  const float d = item.d;
+  const int32_t d = item.d;
 
   if (nx == 1) {
     const int n1 = nSteps(x, y, maxSteps);
-    const int n2 = nSteps(x, y+d*(ny-1), maxSteps);
+    const int n2 = nSteps(x, y + d * (ny - 1), maxSteps);
 
     setGridPixel(xi, yi, n1);
     setGridPixel(xi, yi + ny - 1, n2);
@@ -330,13 +325,13 @@ void processWorkItem(WorkItem& item) {
     const int ny2 = ny-2-ny1;
 
     enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny1, d, maxSteps);
-    enqueueOrProcess(xi, x, 1, yi + 1 + ny1, y + d*(1 + ny1), ny2, d, maxSteps);
+    enqueueOrProcess(xi, x, 1, yi + 1 + ny1, y + d * (1 + ny1), ny2, d, maxSteps);
     return;
   }
 
   if (ny == 1) {
     const int n1 = nSteps(x, y, maxSteps);
-    const int n2 = nSteps(x + d*(nx-1), y, maxSteps);
+    const int n2 = nSteps(x + d * (nx - 1), y, maxSteps);
 
     setGridPixel(xi, yi, n1);
     setGridPixel(xi + nx - 1, yi, n2);
@@ -351,14 +346,14 @@ void processWorkItem(WorkItem& item) {
     const int nx2 = nx-2-nx1;
 
     enqueueOrProcess(xi + 1, x + d, nx1, yi, y, 1, d, maxSteps);
-    enqueueOrProcess(xi + 1 + nx1, x + d*(1 + nx1), nx2, yi, y, 1, d, maxSteps);
+    enqueueOrProcess(xi + 1 + nx1, x + d * (1 + nx1), nx2, yi, y, 1, d, maxSteps);
     return;
   }
 
   int n1 = nSteps(x, y, maxSteps);
-  int n2 = nSteps(x + d*(nx-1), y, maxSteps);
-  int n3 = nSteps(x, y + d*(ny-1), maxSteps);
-  int n4 = nSteps(x + d*(nx-1), y + d*(ny-1), maxSteps);
+  int n2 = nSteps(x + d * (nx - 1), y, maxSteps);
+  int n3 = nSteps(x, y + d * (ny - 1), maxSteps);
+  int n4 = nSteps(x + d * (nx - 1), y + d * (ny - 1), maxSteps);
 
   if (n1 == n2 && n1 == n3 && n1 == n4 && (n1 < maxSteps)) {
     // Fill entire block - set grid values then render as single region
@@ -385,10 +380,10 @@ void processWorkItem(WorkItem& item) {
 
   // Subdivide and add to queue (or process directly if queue is full)
   enqueueOrProcess(xi + 1, x + d, nx-2, yi, y, 1, d, maxSteps);
-  enqueueOrProcess(xi + 1, x + d, nx-2, yi + ny - 1, y + d*(ny-1), 1, d, maxSteps);
+  enqueueOrProcess(xi + 1, x + d, nx-2, yi + ny - 1, y + d * (ny - 1), 1, d, maxSteps);
 
   enqueueOrProcess(xi, x, 1, yi + 1, y + d, ny-2, d, maxSteps);
-  enqueueOrProcess(xi + nx - 1, x + d*(nx-1), 1, yi + 1, y + d, ny-2, d, maxSteps);
+  enqueueOrProcess(xi + nx - 1, x + d * (nx - 1), 1, yi + 1, y + d, ny-2, d, maxSteps);
 
   const int nx1 = (nx-2)/2;
   const int nx2 = nx-2-nx1;
@@ -396,9 +391,9 @@ void processWorkItem(WorkItem& item) {
   const int ny1 = (ny-2)/2;
   const int ny2 = ny-2-ny1;
   enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1,       y + d,         ny1, d, maxSteps);
-  enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
-  enqueueOrProcess(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
-  enqueueOrProcess(xi + 1 + nx1, x + d + nx1*d,   nx2, yi + 1 + ny1, y + d + ny1*d, ny2, d, maxSteps);
+  enqueueOrProcess(xi + 1,       x + d,           nx1, yi + 1 + ny1, y + d + ny1 * d, ny2, d, maxSteps);
+  enqueueOrProcess(xi + 1 + nx1, x + d + nx1 * d,   nx2, yi + 1,       y + d,         ny1, d, maxSteps);
+  enqueueOrProcess(xi + 1 + nx1, x + d + nx1 * d,   nx2, yi + 1 + ny1, y + d + ny1 * d, ny2, d, maxSteps);
 }
 
 // Worker task - pulls work from queue and processes it
@@ -422,11 +417,11 @@ void workerTask(void* params) {
       processWorkItem(item);
 #else
       // Naive algorithm - just calculate the region
-      float scale = item.d;
+      int32_t scale = item.d;
       for (int xi = item.xi; xi < item.xi + item.nx; xi++) {
         for (int yi = item.yi; yi < item.yi + item.ny; yi++) {
-          float x = item.x + (xi - item.xi) * scale;
-          float y = item.y + (yi - item.yi) * scale;
+          int32_t x = item.x + (xi - item.xi) * scale;
+          int32_t y = item.y + (yi - item.yi) * scale;
           int n = nSteps(x, y, item.maxSteps);
           setGridPixel(xi, yi, n);
         }
@@ -514,27 +509,30 @@ void renderMandelbrot(const float xm, const float ym, const float dm, const int 
 #if USE_OPTIMIZED_ALGORITHM
   WorkItem initialWorkItem;
   initialWorkItem.xi = 0;
-  initialWorkItem.x = xm;
+  initialWorkItem.x = toFixed(xm);
   initialWorkItem.nx = WIDTH;
   initialWorkItem.yi = 0;
-  initialWorkItem.y = ym;
+  initialWorkItem.y = toFixed(ym);
   initialWorkItem.ny = HEIGHT;
-  initialWorkItem.d = g_renderScale;
+  initialWorkItem.d = toFixed(g_renderScale);
   initialWorkItem.maxSteps = maxSteps;
   xQueueSend(g_workQueue, &initialWorkItem, 0);
 #else
   // For naive algorithm, split into chunks for better distribution
   int chunkSize = 40; // Process in 40-pixel wide vertical strips
+  int32_t xm_fp = toFixed(xm);
+  int32_t ym_fp = toFixed(ym);
+  int32_t scale_fp = toFixed(g_renderScale);
   for (int xi = 0; xi < WIDTH; xi += chunkSize) {
     int nx = min(chunkSize, WIDTH - xi);
     WorkItem item;
     item.xi = xi;
-    item.x = xm + xi * g_renderScale;
+    item.x = xm_fp + xi * scale_fp;
     item.nx = nx;
     item.yi = 0;
-    item.y = ym;
+    item.y = ym_fp;
     item.ny = HEIGHT;
-    item.d = g_renderScale;
+    item.d = scale_fp;
     item.maxSteps = maxSteps;
     xQueueSend(g_workQueue, &item, 0);
   }
