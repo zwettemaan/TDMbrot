@@ -19,14 +19,13 @@ TFT_eSPI tft = TFT_eSPI();
 #define HEIGHT 320
 
 // ============================================================================
-// Fixed-point arithmetic (8.24 format) - 8 integer bits, 24 fractional bits
+// Fixed-point arithmetic (16.48 format) - 16 integer bits, 48 fractional bits
 // ============================================================================
-#define FP_SHIFT 24
-#define FP_SCALE 16777216  // 2^24
+#define FP_SHIFT 48
+#define FP_SCALE 281474976710656LL  // 2^48
 
-// Type aliases for fixed-point numbers
-typedef int32_t TFixedPoint;      // Standard fixed-point (8.24)
-typedef int64_t TWideFixedPoint;  // Wide fixed-point for intermediate results
+// Type alias for fixed-point numbers
+typedef int64_t TFixedPoint;  // Standard fixed-point (16.48)
 
 // Grid to store Mandelbrot iteration counts
 uint16_t grid[WIDTH][HEIGHT];
@@ -47,20 +46,20 @@ const int c_maxIterations = 10000;
 int calculateMaxSteps(float dm) {
   // Base iteration count
   const int baseSteps = 200;
-  
+
   // Calculate zoom depth (smaller dm = deeper zoom)
   // Initial dm is around 4.0 (full view), zooming in makes it smaller
   float zoomDepth = log(4.0 / dm) / log(2.0);  // log2 of zoom factor
-  
+
   // Increase steps as we zoom in
   // Add 50 steps per doubling of zoom
   int additionalSteps = (int)(zoomDepth * 50);
-  
+
   // Cap at maximum to avoid very slow renders
   int maxSteps = baseSteps + additionalSteps;
   if (maxSteps > c_maxIterations) maxSteps = c_maxIterations;
   if (maxSteps < baseSteps) maxSteps = baseSteps;
-  
+
   return maxSteps;
 }
 
@@ -97,24 +96,51 @@ void processWorkItem(WorkItem& item);
 
 // Convert float to fixed-point
 inline TFixedPoint toFixed(float value) {
-  return (TFixedPoint)(value * FP_SCALE);
+  return (TFixedPoint)((double)value * FP_SCALE);
 }
 
 // Convert float constant to fixed-point at compile time
-#define FP_CONST(x) ((TFixedPoint)((x) * FP_SCALE))
+#define FP_CONST(x) ((TFixedPoint)((double)(x) * FP_SCALE))
 
-// Multiply two fixed-point numbers (returns wide fixed-point)
-inline TWideFixedPoint fpMul(TFixedPoint a, TFixedPoint b) {
-  return ((TWideFixedPoint)a * b) >> FP_SHIFT;
+// Multiply two fixed-point numbers (returns fixed-point)
+// Uses Karatsuba-style multiplication to avoid overflow
+inline TFixedPoint fpMul(TFixedPoint a, TFixedPoint b) {
+  // Split into high and low 32-bit parts
+  int64_t a_hi = a >> 32;
+  int64_t a_lo = a & 0xFFFFFFFFLL;
+  int64_t b_hi = b >> 32;
+  int64_t b_lo = b & 0xFFFFFFFFLL;
+
+  // Perform multiplication in parts
+  // (a_hi * 2^32 + a_lo) * (b_hi * 2^32 + b_lo) >> 48
+  int64_t hi = a_hi * b_hi;
+  int64_t mid = a_hi * b_lo + a_lo * b_hi;
+  int64_t lo = a_lo * b_lo;
+
+  // Combine and shift: result = (hi * 2^64 + mid * 2^32 + lo) >> 48
+  // = hi * 2^16 + (mid >> 16) + (lo >> 48)
+  return (hi << 16) + (mid >> 16) + (lo >> 48);
 }
 
 // Multiply two fixed-point numbers with double shift (for 2*x*y operations)
-inline TWideFixedPoint fpMul2(TFixedPoint a, TFixedPoint b) {
-  return ((TWideFixedPoint)a * b) >> (FP_SHIFT - 1);
+inline TFixedPoint fpMul2(TFixedPoint a, TFixedPoint b) {
+  // Same as fpMul but shift by 47 instead of 48
+  int64_t a_hi = a >> 32;
+  int64_t a_lo = a & 0xFFFFFFFFLL;
+  int64_t b_hi = b >> 32;
+  int64_t b_lo = b & 0xFFFFFFFFLL;
+
+  int64_t hi = a_hi * b_hi;
+  int64_t mid = a_hi * b_lo + a_lo * b_hi;
+  int64_t lo = a_lo * b_lo;
+
+  // Shift by 47: result = (hi * 2^64 + mid * 2^32 + lo) >> 47
+  // = hi * 2^17 + (mid >> 15) + (lo >> 47)
+  return (hi << 17) + (mid >> 15) + (lo >> 47);
 }
 
-// Square a fixed-point number (returns wide fixed-point)
-inline TWideFixedPoint fpSquare(TFixedPoint value) {
+// Square a fixed-point number (returns fixed-point)
+inline TFixedPoint fpSquare(TFixedPoint value) {
   return fpMul(value, value);
 }
 
@@ -123,23 +149,8 @@ inline TFixedPoint fpAdd(TFixedPoint a, TFixedPoint b) {
   return a + b;
 }
 
-// Add two wide fixed-point numbers
-inline TWideFixedPoint fpAdd(TWideFixedPoint a, TWideFixedPoint b) {
-  return a + b;
-}
-
-// Add fixed-point to wide fixed-point
-inline TWideFixedPoint fpAdd(TWideFixedPoint a, TFixedPoint b) {
-  return a + b;
-}
-
 // Subtract two fixed-point numbers
 inline TFixedPoint fpSub(TFixedPoint a, TFixedPoint b) {
-  return a - b;
-}
-
-// Subtract two wide fixed-point numbers
-inline TWideFixedPoint fpSub(TWideFixedPoint a, TWideFixedPoint b) {
   return a - b;
 }
 
@@ -147,19 +158,19 @@ inline TWideFixedPoint fpSub(TWideFixedPoint a, TWideFixedPoint b) {
 // Returns true if the point is definitely inside the set
 inline bool isInsideOfSet(TFixedPoint px, TFixedPoint py) {
   // Calculate squares once
-  const TWideFixedPoint px2 = fpSquare(px);
-  const TWideFixedPoint py2 = fpSquare(py);
+  const TFixedPoint px2 = fpSquare(px);
+  const TFixedPoint py2 = fpSquare(py);
 
   // Quick check: main cardioid
   // Formula: q = (x-0.25)^2 + y^2, check if q*(q + (x-0.25)) < 0.25*y^2
   // Expanded: q = (x-0.25)^2 + y^2 = x^2 - 0.5*x + 0.0625 + y^2
   // Reuse calculated x^2 and y^2 to avoid redundant computation
-  const TWideFixedPoint q_x = px - FP_CONST(0.25);
-  const TWideFixedPoint q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
+  const TFixedPoint q_x = px - FP_CONST(0.25);
+  const TFixedPoint q = px2 + py2 - (px >> 1) + FP_CONST(0.0625);  // px>>1 divides by 2 (i.e., 0.5*x)
 
   // Check: q * (q + (x-0.25)) < 0.25 * y^2
-  const TWideFixedPoint cardioid_lhs = fpMul(q, fpAdd(q, q_x));
-  const TWideFixedPoint cardioid_rhs = py2 >> 2;  // Divide by 4 = multiply by 0.25
+  const TFixedPoint cardioid_lhs = fpMul(q, fpAdd(q, q_x));
+  const TFixedPoint cardioid_rhs = py2 >> 2;  // Divide by 4 = multiply by 0.25
   if (cardioid_lhs < cardioid_rhs) {
     return true;
   }
@@ -167,7 +178,7 @@ inline bool isInsideOfSet(TFixedPoint px, TFixedPoint py) {
   // Check period-2 bulb: (x + 1)^2 + y^2 < 0.0625
   // Expand: (x + 1)^2 + y^2 = x^2 + 2*x + 1 + y^2
   // Reuse pre-calculated squares
-  const TWideFixedPoint bulb_dist = px2 + py2 + (px << 1) + FP_SCALE;  // px<<1 is 2*x
+  const TFixedPoint bulb_dist = px2 + py2 + (px << 1) + FP_SCALE;  // px<<1 is 2*x
   if (bulb_dist < FP_CONST(0.0625)) {
     return true;
   }
@@ -205,7 +216,7 @@ int nSteps(TFixedPoint cx, TFixedPoint cy, int maxSteps) {
 
     // Mandelbrot iteration: z = z^2 + c
     const TFixedPoint xtemp = fpAdd(fpSub(x2, y2), cx);
-    y = (TFixedPoint)fpAdd(fpMul2(x, y), cy);
+    y = fpAdd(fpMul2(x, y), cy);
     x = xtemp;
 
     steps++;
@@ -635,7 +646,7 @@ bool button2WasPressed = false;
 
 // Draw direction selection menu
 void drawDirectionMenu() {
-  
+
   // Draw title text
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -643,12 +654,12 @@ void drawDirectionMenu() {
   tft.println("left button = pick");
   tft.setCursor(10, 20);
   tft.println("right button = action");
-  
+
   // Draw directional arrows/labels in compass layout
   const int centerX = WIDTH / 2;
   const int centerY = HEIGHT / 2;
   const int spacing = 40;
-  
+
   // Positions: N, E, S, W
   const int positions[][2] = {
     {centerX, centerY - spacing},      // N
@@ -656,11 +667,11 @@ void drawDirectionMenu() {
     {centerX, centerY + spacing},      // S
     {centerX - spacing, centerY}       // W
   };
-  
+
   for (int i = 0; i < 4; i++) {
     int x = positions[i][0];
     int y = positions[i][1];
-    
+
     // Draw box around selected item
     if (i == g_menuSelection) {
       tft.fillRect(x - 15, y - 10, 30, 20, TFT_GREEN);
@@ -669,7 +680,7 @@ void drawDirectionMenu() {
       tft.fillRect(x - 15, y - 10, 30, 20, TFT_DARKGREY);
       tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
     }
-    
+
     // Draw direction label centered
     tft.setTextSize(2);
     tft.setCursor(x - 6, y - 8);
@@ -679,7 +690,7 @@ void drawDirectionMenu() {
 
 // Draw zoom selection menu
 void drawZoomMenu() {
-  
+
   // Draw title text
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -687,15 +698,15 @@ void drawZoomMenu() {
   tft.println("left button = pick");
   tft.setCursor(10, 20);
   tft.println("right button = action");
-  
+
   // Draw zoom options in a grid
   const int startY = 60;
   const int spacing = 35;
-  
+
   for (int i = 0; i < 4; i++) {
     int x = WIDTH / 2 - 30;
     int y = startY + i * spacing;
-    
+
     // Draw box around selected item
     if (i == g_menuSelection) {
       tft.fillRect(x - 5, y - 5, 70, 25, TFT_GREEN);
@@ -704,7 +715,7 @@ void drawZoomMenu() {
       tft.fillRect(x - 5, y - 5, 70, 25, TFT_DARKGREY);
       tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
     }
-    
+
     // Draw zoom factor
     tft.setTextSize(2);
     tft.setCursor(x, y);
@@ -721,7 +732,7 @@ void handleButtons() {
   // Button 1 (left) - pressed
   if (btn1 && !button1WasPressed) {
     button1WasPressed = true;
-    
+
     if (g_menuState == MENU_NONE) {
       // First press - open zoom menu
       g_menuState = MENU_ZOOM;
@@ -735,10 +746,10 @@ void handleButtons() {
       // Execute direction shift (opposite button from the one that opened the menu)
       float offsetX = g_directionOffsets[g_menuSelection][0] * g_dm;
       float offsetY = g_directionOffsets[g_menuSelection][1] * g_dm * 320.0 / 170.0;
-      
+
       g_xm += offsetX;
       g_ym += offsetY;
-      
+
       g_menuState = MENU_NONE;
       Serial.printf("Shifting %s\n", g_directions[g_menuSelection]);
       renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
@@ -750,7 +761,7 @@ void handleButtons() {
   // Button 2 (right) - pressed
   if (btn2 && !button2WasPressed) {
     button2WasPressed = true;
-    
+
     if (g_menuState == MENU_NONE) {
       // First press - open direction menu
       g_menuState = MENU_DIRECTION;
@@ -765,27 +776,27 @@ void handleButtons() {
       float zoomFactor = g_zoomFactors[g_menuSelection];
       float centerX = g_xm + g_dm / 2.0;
       float centerY = g_ym + (g_dm * 320.0 / 170.0) / 2.0;
-      
+
       float new_dm = g_dm / zoomFactor;
-      
+
       // Check if zoom would exceed fixed-point precision
       // With 8.24 format, minimum representable step is 1/2^24 ≈ 6e-8
       // We need at least 2 units per pixel step for safety
       float newScale = new_dm / 170.0;
       float minScale = 2.0 / FP_SCALE;  // Minimum safe scale
-      
+
       if (newScale < minScale) {
         Serial.printf("Zoom limit reached - scale %.2e would be below fixed-point precision %.2e\n", newScale, minScale);
         g_menuState = MENU_NONE;
         renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
         return;
       }
-      
+
       // Recalculate top-left to keep center stable
       g_dm = new_dm;
       g_xm = centerX - g_dm / 2.0;
       g_ym = centerY - (g_dm * 320.0 / 170.0) / 2.0;
-      
+
       g_menuState = MENU_NONE;
       Serial.printf("Zooming by %.2fx\n", zoomFactor);
       renderMandelbrot(g_xm, g_ym, g_dm, calculateMaxSteps(g_dm));
